@@ -71679,12 +71679,23 @@ static int ds4_engine_open_internal(ds4_engine **out,
                                                         spans.max_tensor_bytes);
             free(spans.v);
         } else {
-            e->startup_model_span_bytes = e->model.size > e->model.tensor_data_pos ?
-                e->model.size - e->model.tensor_data_pos : 0;
+            uint64_t map_pos = e->model.tensor_data_pos;
+#ifdef __APPLE__
+            /* The Qwen graph reads token embeddings on the CPU.  Leave a
+             * leading table out of the view: Metal wires all of a no-copy
+             * buffer, and outside it the table is ordinary page cache. */
+            const ds4_tensor *te = e->weights.token_embd;
+            if (ds4_model_is_qwen4() && te && te->abs_offset == map_pos &&
+                te->bytes < e->model.size - map_pos) {
+                map_pos += te->bytes;
+            }
+#endif
+            e->startup_model_span_bytes = e->model.size > map_pos ?
+                e->model.size - map_pos : 0;
             model_map_ok = ds4_gpu_set_model_map_range(e->model.map,
                                                        e->model.size,
-                                                       e->model.tensor_data_pos,
-                                                       e->model.size - e->model.tensor_data_pos,
+                                                       map_pos,
+                                                       e->model.size - map_pos,
                                                        e->model.max_tensor_bytes);
         }
         if (!model_map_ok) {
