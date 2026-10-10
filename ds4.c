@@ -57578,6 +57578,7 @@ typedef struct ds4_qwen4_gpu_graph {
     uint32_t cap_tokens;
     uint32_t k_blocks;
     uint32_t n_block_cap;
+    uint32_t kv_cap; /* rows the attention caches hold now; grows up to ctx_cap */
     uint32_t sel_stride;
     /* false when the scratch above is borrowed from the engine's arena */
     bool owns_scratch;
@@ -57877,6 +57878,80 @@ static ds4_gpu_tensor *qwen4_graph_alloc_f32(uint64_t n) {
     return t;
 }
 
+/* The attention caches start at one step of rows and grow with the
+ * conversation, so a large --ctx costs memory only once it is used: Metal
+ * wires a whole buffer on first use, whatever part of it holds tokens.
+ * DS4_QWEN4_KV_STEP sets the step in rows; 0 allocates ctx_cap up front. */
+static uint32_t qwen4_kv_step(void) {
+    static int64_t step = -1;
+    if (step < 0) {
+        const char *env = getenv("DS4_QWEN4_KV_STEP");
+#ifdef __APPLE__
+        step = 16384;
+#else
+        step = 0; /* growth copies through host-visible tensor contents */
+#endif
+        if (env && env[0]) step = (int64_t)strtoul(env, NULL, 10);
+    }
+    return (uint32_t)step;
+}
+
+static bool qwen4_kv_swap(ds4_gpu_tensor **slot, ds4_gpu_tensor *fresh) {
+    if (!fresh) return false;
+    if (*slot) {
+        const uint64_t old = ds4_gpu_tensor_bytes(*slot), now = ds4_gpu_tensor_bytes(fresh);
+        void *src = ds4_gpu_tensor_contents(*slot), *dst = ds4_gpu_tensor_contents(fresh);
+        if (!src || !dst) {
+            ds4_gpu_tensor_free(fresh);
+            return false;
+        }
+        memcpy(dst, src, old < now ? old : now);
+        ds4_gpu_tensor_free(*slot);
+    }
+    *slot = fresh;
+    return true;
+}
+
+/* Reallocate every attention cache at cap rows, keeping what fits.  The
+ * caller has synchronized: command buffers do not retain their buffers.
+ * kv_cap never exceeds the smallest cache, also when an allocation fails
+ * part way: it drops before a shrink and rises after a growth. */
+static bool qwen4_graph_kv_resize(ds4_qwen4_gpu_graph *g, uint32_t cap) {
+    const uint64_t kv_dim = (uint64_t)DS4_N_HEAD_KV * DS4_N_HEAD_DIM;
+    const uint32_t was = g->kv_cap;
+    if (cap < g->kv_cap) g->kv_cap = cap;
+    for (uint32_t il = 0; il < DS4_N_LAYER; il++) {
+        if (ds4_qwen4_layer_is_linear(il)) continue;
+        if (!qwen4_kv_swap(&g->layer_k_cache[il], ds4_gpu_tensor_alloc((uint64_t)cap * kv_dim * 2u)) ||
+            !qwen4_kv_swap(&g->layer_v_cache[il], ds4_gpu_tensor_alloc((uint64_t)cap * kv_dim * 2u)) ||
+            !qwen4_kv_swap(&g->layer_ik_cache[il], qwen4_graph_alloc_f32((uint64_t)cap * DS4_N_INDEXER_HEAD_DIM)) ||
+            !qwen4_kv_swap(&g->layer_block_key[il],
+                           ds4_gpu_tensor_alloc((uint64_t)(cap / 4u + 1u) * DS4_N_INDEXER_HEAD_DIM * 2u))) {
+            return false;
+        }
+    }
+    if (was) fprintf(stderr, "ds4: Qwen3.8 attention caches %u -> %u rows\n", was, cap);
+    g->kv_cap = cap;
+    return true;
+}
+
+/* Make rows [0, rows) of the caches writable.  Positions past ctx_cap stay
+ * the callers' own bounds checks.  Never call this on a copy of a session's
+ * graph: the copy's cache pointers would be the only ones updated. */
+static bool qwen4_graph_kv_reserve(ds4_qwen4_gpu_graph *g, uint64_t rows) {
+    if (rows > g->ctx_cap) rows = g->ctx_cap;
+    if (rows <= g->kv_cap) return true;
+    const uint64_t step = qwen4_kv_step();
+    uint64_t cap = step ? (rows + step - 1u) / step * step : g->ctx_cap;
+    if (cap > g->ctx_cap) cap = g->ctx_cap;
+    const bool active = ds4_gpu_commands_active();
+    if (!ds4_gpu_synchronize() || !qwen4_graph_kv_resize(g, (uint32_t)cap)) {
+        fprintf(stderr, "ds4: Qwen3.8 attention cache growth to %llu rows failed\n", (unsigned long long)cap);
+        return false;
+    }
+    return !active || ds4_gpu_begin_commands() != 0;
+}
+
 /* shared borrows the engine arena for the transients; NULL allocates private
  * ones.  A borrowing graph must fit inside the arena it borrows: the caller
  * checks cap_tokens and n_block_cap before passing one.
@@ -58003,13 +58078,11 @@ private_state:
                 g->snap_lin_hist[il] = qwen4_graph_alloc_f32((uint64_t)(DS4_N_LIN_CONV - 1u) * conv_dim);
                 ok = g->snap_lin_state[il] && g->snap_lin_hist[il];
             }
-        } else {
-            g->layer_k_cache[il] = ds4_gpu_tensor_alloc((uint64_t)ctx_cap * kv_dim * 2u);
-            g->layer_v_cache[il] = ds4_gpu_tensor_alloc((uint64_t)ctx_cap * kv_dim * 2u);
-            g->layer_ik_cache[il] = qwen4_graph_alloc_f32((uint64_t)ctx_cap * DS4_N_INDEXER_HEAD_DIM);
-            g->layer_block_key[il] = ds4_gpu_tensor_alloc((uint64_t)g->n_block_cap * DS4_N_INDEXER_HEAD_DIM * 2u);
-            ok = ok && g->layer_k_cache[il] && g->layer_v_cache[il] && g->layer_ik_cache[il] && g->layer_block_key[il];
         }
+    }
+    {
+        const uint32_t step = qwen4_kv_step();
+        ok = ok && qwen4_graph_kv_resize(g, step && step < ctx_cap ? step : ctx_cap);
     }
     g->pos3 = qwen4_graph_alloc_f32((uint64_t)ctx_cap * 4u);
     ok = ok && g->pos3;
@@ -58113,6 +58186,10 @@ static void qwen4_graph_dump_last_attn(ds4_qwen4_gpu_graph *g, uint32_t il, uint
 
 static void qwen4_graph_reset(ds4_qwen4_gpu_graph *g) {
     (void)ds4_gpu_synchronize();
+    /* An empty context gives the grown caches back.  A failed shrink keeps
+     * the larger ones, which are still valid. */
+    const uint32_t kv_step = qwen4_kv_step();
+    if (kv_step && g->kv_cap > kv_step) (void)qwen4_graph_kv_resize(g, kv_step);
     const uint64_t conv_dim = DS4_N_LIN_CONV_DIM;
     const uint64_t v_dim = (uint64_t)DS4_N_LIN_V_HEAD * DS4_N_LIN_HEAD_DIM;
     for (uint32_t il = 0; il < DS4_N_LAYER; il++) {
@@ -58451,12 +58528,13 @@ static bool qwen4_graph_attention_tail(ds4_qwen4_gpu_graph *g, const ds4_model *
     const uint32_t ratio = 4u;
     const uint32_t last = pos0 + T - 1u;
     const uint32_t q_dim = DS4_N_HEAD * DS4_N_HEAD_DIM;
+    if (!qwen4_graph_kv_reserve(g, (uint64_t)pos0 + T)) return false;
     if (!(ds4_gpu_qwen4_attn_prep_tensor(g->q, g->gate, g->layer_k_cache[il], g->layer_v_cache[il], g->iqn,
                                          g->layer_ik_cache[il], g->qg, g->kp, g->vp, g->iq, g->ik, g->pos3,
                                          m->map, m->size, l->attn_q_norm->abs_offset, l->attn_k_norm->abs_offset,
                                          l->indexer_q_norm->abs_offset, T, DS4_N_HEAD, DS4_N_HEAD_KV,
                                          DS4_N_HEAD_DIM, DS4_N_ROT, DS4_N_INDEXER_HEAD, DS4_N_INDEXER_HEAD_DIM,
-                                         pos0, g->ctx_cap, DS4_ROPE_FREQ_BASE, DS4_RMS_EPS))) {
+                                         pos0, g->kv_cap, DS4_ROPE_FREQ_BASE, DS4_RMS_EPS))) {
         return false;
     }
     /* blocks whose last token falls in this chunk get their pooled keys */
@@ -62786,6 +62864,11 @@ static int qwen4_session_load_payload(ds4_session *s, FILE *fp, const uint32_t *
     if (ds4_gpu_synchronize() == 0) {
         token_vec_free(&new_checkpoint);
         payload_set_err(err, errlen, "failed to synchronize accelerator before Qwen3.8 restore");
+        return 1;
+    }
+    if (!qwen4_graph_kv_reserve(g, rows)) {
+        token_vec_free(&new_checkpoint);
+        payload_set_err(err, errlen, "failed to grow the attention caches for Qwen3.8 restore");
         return 1;
     }
     uint32_t mtp_rows = 0;
@@ -78505,7 +78588,7 @@ static bool qwen4_batch_attention_rows(int count, ds4_qwen4_gpu_graph *rowg,
         rows[i].pos3 = r->pos3;
         rows[i].pos = r->pos;
         rows[i].use_sel = r->pos >= sparse_pos;
-        if (r->pos >= r->ctx_cap) return false;
+        if (r->pos >= r->kv_cap) return false;
     }
     return qwen4_batch_attention_entries(rows, (uint32_t)count, g, m, l, il);
 }
@@ -78537,7 +78620,7 @@ static bool qwen4_batch_attention(int count, ds4_qwen4_gpu_graph *rowg,
                                             l->indexer_q_norm->abs_offset, 1u, DS4_N_HEAD,
                                             DS4_N_HEAD_KV, DS4_N_HEAD_DIM, DS4_N_ROT,
                                             DS4_N_INDEXER_HEAD, DS4_N_INDEXER_HEAD_DIM,
-                                            pos0, r->ctx_cap, DS4_ROPE_FREQ_BASE, DS4_RMS_EPS);
+                                            pos0, r->kv_cap, DS4_ROPE_FREQ_BASE, DS4_RMS_EPS);
         const uint32_t first_block = pos0 / ratio;
         const uint32_t n_blocks_after = (pos0 + 1u) / ratio;
         if (ok && n_blocks_after > first_block) {
@@ -78565,7 +78648,9 @@ static bool qwen4_graph_encode_native_session_batch(ds4_decode_item *items, int 
     ds4_qwen4_gpu_graph *rowg = xmalloc((size_t)count * sizeof(*rowg));
     bool ok = qwen4_batch_rows_build(views, count, g);
     for (int i = 0; ok && i < count; i++) {
-        qwen4_batch_row_graph(&rowg[i], items[i].session, &views[i]);
+        ds4_qwen4_gpu_graph *sg = &items[i].session->qwen4_graph;
+        ok = qwen4_graph_kv_reserve(sg, (uint64_t)sg->pos + 1u);
+        if (ok) qwen4_batch_row_graph(&rowg[i], items[i].session, &views[i]);
     }
     if (ok) ok = qwen4_batch_scratch_ensure(g, T);
 
@@ -78753,7 +78838,11 @@ static bool qwen4_graph_encode_native_session_batch_ragged(const qwen4_batch_mem
     ds4_qwen4_gpu_graph *rowg = xmalloc((size_t)count * sizeof(*rowg));
     uint32_t *ple_ids = xmalloc((size_t)N * DS4_MAX_PLE_HEADS * sizeof(uint32_t));
     bool ok = qwen4_batch_rows_build_ragged(views, mem, count, g);
-    for (int i = 0; ok && i < count; i++) qwen4_batch_row_graph(&rowg[i], mem[i].session, &views[i]);
+    for (int i = 0; ok && i < count; i++) {
+        ds4_qwen4_gpu_graph *sg = &mem[i].session->qwen4_graph;
+        ok = qwen4_graph_kv_reserve(sg, (uint64_t)sg->pos + mem[i].n);
+        if (ok) qwen4_batch_row_graph(&rowg[i], mem[i].session, &views[i]);
+    }
     if (ok) ok = qwen4_batch_scratch_ensure(g, N > 32u ? N : 32u);
     if (ok) ok = qwen4_batch_stage_embeddings_ragged(mem, count, N, m, w, g, ple_ids);
     bool ngrams_staged = false;
@@ -78838,7 +78927,7 @@ static bool qwen4_graph_encode_native_session_batch_ragged(const qwen4_batch_mem
                     e->pos3 = r->pos3;
                     e->pos = r->pos + t;
                     e->use_sel = e->pos >= sparse_pos;
-                    if (e->pos >= r->ctx_cap) ok = false;
+                    if (e->pos >= r->kv_cap) ok = false;
                 }
             }
             if (ok) ok = qwen4_batch_attention_entries(arows, T, g, m, l, il) &&
@@ -78876,7 +78965,8 @@ static bool qwen4_batch_mtp_drafts(qwen4_batch_member *mem, int count, const uin
     ds4_gpu_qwen4_attn_row arows[2 * QWEN4_BATCH_MAX_ROWS];
     const uint32_t sparse_pos = (g->k_blocks + 1u) * 4u - 1u;
     for (int i = 0; i < count; i++) {
-        const ds4_qwen4_gpu_graph *r = &mem[i].session->qwen4_graph;
+        ds4_qwen4_gpu_graph *r = &mem[i].session->qwen4_graph;
+        if (!qwen4_graph_kv_reserve(r, (uint64_t)idx0[i] + mem[i].n)) return false;
         for (uint32_t t = 0; t < mem[i].n; t++) {
             ids[mem[i].row0 + t] = t + 1u < committed[i] ? mem[i].tokens[t + 1u] : parents[i];
             ds4_gpu_qwen4_attn_row *e = &arows[mem[i].row0 + t];
@@ -78887,7 +78977,7 @@ static bool qwen4_batch_mtp_drafts(qwen4_batch_member *mem, int count, const uin
             e->pos3 = r->pos3;
             e->pos = idx0[i] + t;
             e->use_sel = e->pos >= sparse_pos;
-            if (e->pos >= r->ctx_cap) return false;
+            if (e->pos >= r->kv_cap) return false;
         }
     }
     for (uint32_t t = 0; t < N; t++)

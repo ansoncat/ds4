@@ -9315,8 +9315,13 @@ uint64_t ds4_gpu_tensor_bytes(const ds4_gpu_tensor *tensor) {
 
 void *ds4_gpu_tensor_contents(ds4_gpu_tensor *tensor) {
     if (!tensor) return NULL;
-    DS4MetalTensor *obj = ds4_gpu_tensor_obj(tensor);
-    return (uint8_t *)[obj.buffer contents] + obj.offset;
+    /* -contents returns an inner pointer, so ARC retains and autoreleases the
+     * buffer.  Callers are C threads with no pool of their own: without this
+     * one a freed tensor's buffer stays allocated behind that reference. */
+    @autoreleasepool {
+        DS4MetalTensor *obj = ds4_gpu_tensor_obj(tensor);
+        return (uint8_t *)[obj.buffer contents] + obj.offset;
+    }
 }
 
 int ds4_gpu_tensor_fill_f32(ds4_gpu_tensor *tensor, float value, uint64_t count) {
