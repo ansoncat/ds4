@@ -9336,7 +9336,7 @@ int ds4_gpu_tensor_write(ds4_gpu_tensor *tensor, uint64_t offset, const void *da
     if (!tensor || (!data && bytes != 0)) return 0;
     DS4MetalTensor *obj = ds4_gpu_tensor_obj(tensor);
     if (offset > obj.bytes || bytes > obj.bytes - offset) return 0;
-    if (bytes != 0) {
+    if (bytes != 0) @autoreleasepool {   /* see ds4_gpu_tensor_contents */
         memcpy((uint8_t *)[obj.buffer contents] + obj.offset + offset, data, (size_t)bytes);
     }
     return 1;
@@ -9346,7 +9346,7 @@ int ds4_gpu_tensor_read(const ds4_gpu_tensor *tensor, uint64_t offset, void *dat
     if (!tensor || (!data && bytes != 0)) return 0;
     const DS4MetalTensor *obj = ds4_gpu_tensor_const_obj(tensor);
     if (offset > obj.bytes || bytes > obj.bytes - offset) return 0;
-    if (bytes != 0) {
+    if (bytes != 0) @autoreleasepool {   /* see ds4_gpu_tensor_contents */
         memcpy(data, (const uint8_t *)[obj.buffer contents] + obj.offset + offset, (size_t)bytes);
     }
     return 1;
