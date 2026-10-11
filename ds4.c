@@ -57601,6 +57601,7 @@ typedef struct ds4_qwen4_gpu_graph {
     uint32_t sel_stride;
     /* false when the scratch above is borrowed from the engine's arena */
     bool owns_scratch;
+    bool score_grows; /* score and tile_max are sized for kv_cap, not ctx_cap */
     ds4_gpu_tensor *R, *xn, *lo, *inj, *mixed, *blk;
     ds4_gpu_tensor *qkv, *z, *ga, *gb, *lin_o;
     ds4_gpu_tensor *ple_emb, *ple_key, *ple_val, *ple_gated, *ple_normed, *ple_hist;
@@ -57932,6 +57933,19 @@ static bool qwen4_kv_swap(ds4_gpu_tensor **slot, ds4_gpu_tensor *fresh) {
     return true;
 }
 
+/* The indexer scores hold a row of blocks per chunk token: 0.25 GiB at
+ * 262144 tokens and a 1024 chunk, wired like the caches.  A session whose
+ * transients are its own for good sizes them for the blocks its caches hold. */
+static bool qwen4_graph_score_fit(ds4_qwen4_gpu_graph *g) {
+    if (!g->score_grows) return true;
+    const uint64_t T = g->cap_tokens, blocks = g->kv_cap / 4u + 1u;
+    ds4_gpu_tensor_free(g->score);
+    ds4_gpu_tensor_free(g->tile_max);
+    g->score = qwen4_graph_alloc_f32(T * blocks);
+    g->tile_max = qwen4_graph_alloc_f32(T * (blocks / 8u + 1u));
+    return g->score && g->tile_max;
+}
+
 /* Reallocate every attention cache at cap rows, keeping what fits.  The
  * caller has synchronized: command buffers do not retain their buffers.
  * kv_cap never exceeds the smallest cache, also when an allocation fails
@@ -57954,7 +57968,7 @@ static bool qwen4_graph_kv_resize(ds4_qwen4_gpu_graph *g, uint32_t cap) {
     }
     if (was) fprintf(stderr, "ds4: Qwen3.8 attention caches %u -> %u rows\n", was, cap);
     g->kv_cap = cap;
-    return true;
+    return qwen4_graph_score_fit(g);
 }
 
 /* Make rows [0, rows) of the caches writable.  Positions past ctx_cap stay
@@ -73037,6 +73051,12 @@ int ds4_session_create(ds4_session **out, ds4_engine *e, int ctx_size) {
                                s->qwen4_slot >= 0 ? e->qwen4_lin_hist_pool : NULL,
                                s->qwen4_slot >= 0 ? (uint32_t)s->qwen4_slot : 0u)) {
             if (s->qwen4_slot >= 0) e->qwen4_pool_used &= ~(UINT64_C(1) << s->qwen4_slot);
+            free(s);
+            return 1;
+        }
+        s->qwen4_graph.score_grows = !share;
+        if (!qwen4_graph_score_fit(&s->qwen4_graph)) {
+            qwen4_graph_free(&s->qwen4_graph);
             free(s);
             return 1;
         }
