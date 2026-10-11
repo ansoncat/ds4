@@ -24,6 +24,13 @@ static inline float qwen4_silu(float x) {
     return x * qwen4_sigmoid(x);
 }
 
+/* Scale bytes of Q2_K super-block sb: the qs bytes follow them and d, dmin sit
+ * at five times that offset.  Type 40 is a 640-wide row whose third block
+ * keeps only its used half (8 scales, 32 qs bytes, d, dmin; 212-byte rows). */
+static inline uint qwen4_q2k_ns(uint type, uint sb) {
+    return type == 40u && sb == 2u ? 8u : 16u;
+}
+
 static inline float qwen4_row_dot(device const char *row, device const float *x,
                                   uint weight_type, uint in_dim, ushort tiisg);
 
@@ -2640,7 +2647,7 @@ static inline float qwen4_row_dot(device const char *row, device const float *x,
             device const float *y = x + ib * 256 + group * 32 + l;
             for (uint i = 0; i < 8; i++) acc += (ds * (float)((qs[i] >> shift) & 0xFu) - dm) * y[i];
         }
-    } else if (weight_type == 10) {
+    } else if (weight_type == 10 || weight_type == 40) {
         /* q2_K: 84-byte super-blocks of 256 (16 scale/min nibble pairs, 64 packed 2-bit bytes, d, dmin);
          * lane owns 8 consecutive elements: group = lane/2 (16 per block), l = (lane%2)*8 */
         const uint nb = (in_dim + 255u) / 256u;
@@ -2650,11 +2657,12 @@ static inline float qwen4_row_dot(device const char *row, device const float *x,
             /* Padded Q2_K down weights have no corresponding activation tail. */
             if (ib * 256u + group * 16u + l >= in_dim) continue;
             device const uchar *blk = (device const uchar *)(row + (uint64_t)ib * 84);
-            const float d = (float)(*(device const half *)(blk + 80));
-            const float dmin = (float)(*(device const half *)(blk + 82));
+            const uint ns = qwen4_q2k_ns(weight_type, ib);
+            const float d = (float)(*(device const half *)(blk + 5u * ns));
+            const float dmin = (float)(*(device const half *)(blk + 5u * ns + 2u));
             const uint sc = blk[group];
             const float ds = d * (float)(sc & 0xFu), dm = dmin * (float)(sc >> 4);
-            device const uchar *qs = blk + 16 + q_base + l;
+            device const uchar *qs = blk + ns + q_base + l;
             device const float *y = x + ib * 256 + group * 16 + l;
             for (uint i = 0; i < 8; i++) acc += (ds * (float)((qs[i] >> shift) & 3u) - dm) * y[i];
         }
@@ -3446,14 +3454,15 @@ static inline void qwen4_mm_stage8(device const char *row, uint b, uint q, uint 
         for (uint i = 0; i < 8; i++) dst[i] = (D)(ds * (float)((qs[i] >> shift) & 0xFu) - dm);
         return;
     }
-    if (type == 10) {
+    if (type == 10 || type == 40) {
         const uint sb = b / 8, group = (b % 8) * 2 + q / 2, l = (q % 2) * 8;
         device const uchar *blk = (device const uchar *)(row + (uint64_t)sb * 84);
-        const float d = (float)(*(device const half *)(blk + 80));
-        const float dmin = (float)(*(device const half *)(blk + 82));
+        const uint ns = qwen4_q2k_ns(type, sb);
+        const float d = (float)(*(device const half *)(blk + 5u * ns));
+        const float dmin = (float)(*(device const half *)(blk + 5u * ns + 2u));
         const uint sc = blk[group];
         const float ds = d * (float)(sc & 0xFu), dm = dmin * (float)(sc >> 4);
-        device const uchar *qs = blk + 16 + 32u * (group / 8u) + 16u * (group & 1u) + l;
+        device const uchar *qs = blk + ns + 32u * (group / 8u) + 16u * (group & 1u) + l;
         const uint shift = ((group / 2u) & 3u) * 2u;
         for (uint i = 0; i < 8; i++) dst[i] = (D)(ds * (float)((qs[i] >> shift) & 3u) - dm);
         return;
@@ -3510,14 +3519,15 @@ static inline void qwen4_mm_stage16(device const char *row, uint b, uint q0, uin
         for (uint i = 0; i < 16; i++) dst[i] = (D)(ds * (float)((v[i >> 2] >> (8u * (i & 3u) + shift)) & 0xFu) - dm);
         return;
     }
-    if (type == 10) {
+    if (type == 10 || type == 40) {
         const uint sb = b / 8, group = (b % 8) * 2 + q0 / 2;
         device const uchar *blk = (device const uchar *)(row + (uint64_t)sb * 84);
-        const float d = (float)(*(device const half *)(blk + 80));
-        const float dmin = (float)(*(device const half *)(blk + 82));
+        const uint ns = qwen4_q2k_ns(type, sb);
+        const float d = (float)(*(device const half *)(blk + 5u * ns));
+        const float dmin = (float)(*(device const half *)(blk + 5u * ns + 2u));
         const uint sc = blk[group];
         const float ds = d * (float)(sc & 0xFu), dm = dmin * (float)(sc >> 4);
-        device const uint *qs = (device const uint *)(blk + 16 + 32u * (group / 8u) + 16u * (group & 1u));
+        device const uint *qs = (device const uint *)(blk + ns + 32u * (group / 8u) + 16u * (group & 1u));
         const uint shift = ((group / 2u) & 3u) * 2u;
         for (uint i = 0; i < 16; i++) dst[i] = (D)(ds * (float)((qs[i >> 2] >> (8u * (i & 3u) + shift)) & 3u) - dm);
         return;
@@ -3540,12 +3550,13 @@ static inline qwen4_raw16 qwen4_load_raw16(device const char *row, uint b, uint 
         device const uchar *blk = (device const uchar *)(row + (uint64_t)sb * 144);
         r.h = *(device const uint4 *)blk;
         r.q = *(device const uint4 *)(blk + 16 + (group >> 1) * 32 + q0 * 8);
-    } else if (type == 10) {
+    } else if (type == 10 || type == 40) {
         const uint sb = b / 8, g = (b % 8) * 2 + q0 / 2;
         device const uchar *blk = (device const uchar *)(row + (uint64_t)sb * 84);
-        r.h.x = *(device const uint *)(blk + 80);   /* d | dmin << 16 */
+        const uint ns = qwen4_q2k_ns(type, sb);
+        r.h.x = *(device const uint *)(blk + 5u * ns);   /* d | dmin << 16 */
         r.h.y = blk[g];                            /* scale | min nibbles */
-        device const uint *qs = (device const uint *)(blk + 16 + 32u * (g / 8u) + 16u * (g & 1u));
+        device const uint *qs = (device const uint *)(blk + ns + 32u * (g / 8u) + 16u * (g & 1u));
         r.q.x = qs[0]; r.q.y = qs[1]; r.q.z = qs[2]; r.q.w = qs[3];
     } else if (type == 16) {
         const uint sb = b / 8, ib32 = b % 8;
@@ -3579,7 +3590,7 @@ static inline void qwen4_dequant_raw16(qwen4_raw16 r, uint b, uint q0, uint type
         for (uint i = 0; i < 16; i++) dst[i] = (half)(ds * (float)((r.q[i >> 2] >> (8u * (i & 3u) + shift)) & 0xFu) - dm);
         return;
     }
-    if (type == 10) {
+    if (type == 10 || type == 40) {
         const uint g = (b % 8) * 2 + q0 / 2;
         const float d = (float)as_type<half>((ushort)(r.h.x & 0xFFFFu));
         const float dmin = (float)as_type<half>((ushort)(r.h.x >> 16));

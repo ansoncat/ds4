@@ -48328,13 +48328,15 @@ typedef struct {
     uint32_t list_cap, pad0;
 } qwen4_moe_args;
 
+#define QWEN4_Q2K(t) ((t) == 10u || (t) == 40u)   /* 40: q2_K rows of 640, tuned as q2_K */
+
 static bool qwen4_moe_mv_specialize(uint32_t type) {
     /* Constant quantization and logical width remove the generic decode
      * branches. Keep the original per-lane reduction order and padded stride.
      * M3 Ultra uses low-bit and MXFP4 down rows; M5 uses MXFP4 down rows. */
     const int override = ds4_gpu_env_bool("DS4_QWEN4_MOE_MV_SPECIALIZE");
     return override >= 0 ? override != 0 :
-        ((type == 16u || type == 10u || type == 39u) && ds4_gpu_device_name_contains("M3 Ultra")) ||
+        ((type == 16u || QWEN4_Q2K(type) || type == 39u) && ds4_gpu_device_name_contains("M3 Ultra")) ||
         (type == 39u && ds4_gpu_device_is_m5_apple_silicon());
 }
 
@@ -48346,7 +48348,7 @@ static uint32_t qwen4_moe_mv_groups(uint32_t type) {
     /* Q2_K and MXFP4 use sixteen groups on M3 Ultra; MXFP4 also does on M5.
      * Each group keeps its own rows and unchanged per-lane reduction order. */
     const uint32_t default_nsg =
-        ((type == 10u || type == 39u) && ds4_gpu_device_name_contains("M3 Ultra")) ||
+        ((QWEN4_Q2K(type) || type == 39u) && ds4_gpu_device_name_contains("M3 Ultra")) ||
         (type == 39u && ds4_gpu_device_is_m5_apple_silicon()) ? 16u : 8u;
     return (uint32_t)ds4_gpu_env_u64("DS4_QWEN4_MOE_MV_NSG", default_nsg, 1u, 16u);
 }
@@ -48393,7 +48395,7 @@ static int qwen4_dispatch_resident(int kernel, const void *args, size_t args_len
                 ds4_gpu_device_is_m5_apple_silicon();
             const uint32_t type = specialize ?
                 ((const qwen4_moe_mm_args *)args)->weight_type : 0u;
-            if (type >= 40u) return 0;
+            if (type > 40u) return 0;
             const uint32_t tail_base = ((const qwen4_moe_mm_args *)args)->tail_base;
             NSString *key = [NSString stringWithFormat:@"%s_type=%u_tail=%u",
                              qwen4_kernel_names[kernel], type, tail_base];
@@ -48477,6 +48479,7 @@ static uint32_t qwen4_expert_row_bytes(uint32_t weight_type, uint32_t in_dim) {
     case 8u:  return (in_dim / 32u) * 34u;   /* q8_0 */
     case 12u: return (in_dim % 256u) ? 0u : (in_dim / 256u) * 144u;   /* q4_K */
     case 10u: return (in_dim % 256u) ? 0u : (in_dim / 256u) * 84u;    /* q2_K */
+    case 40u: return in_dim == 640u ? 212u : 0u;   /* q2_K, last block cut to its used half */
     case 16u: return (in_dim % 256u) ? 0u : (in_dim / 256u) * 66u;    /* iq2_xxs */
     case 39u: return (in_dim / 32u) * 17u;   /* mxfp4 */
     case 2u:  return (in_dim / 32u) * 18u;   /* q4_0 */
@@ -49760,14 +49763,14 @@ static uint32_t qwen4_moe_mm_nt(uint32_t n_tokens, uint32_t type, const char *en
      * tiles avoid unused matrix products while retaining the same K order.
      * Keep 32-token tiles for larger batches and unmeasured devices/types. */
     uint32_t default_nt = 4u;
-    if ((type == 16u || type == 10u) && ds4_gpu_device_name_contains("M3 Ultra")) {
+    if ((type == 16u || QWEN4_Q2K(type)) && ds4_gpu_device_name_contains("M3 Ultra")) {
         if (n_tokens <= 512u) default_nt = 1u;
         else if (n_tokens <= 1024u) default_nt = 2u;
     }
     const bool down = strstr(env_name, "DOWN") != NULL;
     /* Reuse each decoded down-weight tile across 64 tokens. The K loop and
      * partial-tail accumulation stay unchanged; short batches keep small tiles. */
-    if (down && type == 10u && n_tokens >= 8192u && qwen4_prefill_reuse(n_tokens)) default_nt = 8u;
+    if (down && QWEN4_Q2K(type) && n_tokens >= 8192u && qwen4_prefill_reuse(n_tokens)) default_nt = 8u;
     /* M5: 64-token gate/up and down tiles for the Q4_K / MXFP4 pack at
      * chunk-sized batches (same tile arithmetic; remainders take the
      * 8/16/32-token kernels).  Measured on M5 Max, see
@@ -49799,12 +49802,12 @@ static long qwen4_moe_mm_nax_level(uint32_t type) {
      * 0.20505, Q2 0.30418 vs 0.30346), while it carries the full prefill
      * gain (+48/+51% Q4, +29/+36% Q2).  The compensated level 5 keeps the
      * best absolute NLL and stays one env variable away. */
-    if (!v || !v[0]) return (type == 12u || type == 39u || type == 16u || type == 10u) ? 2 : 0;
+    if (!v || !v[0]) return (type == 12u || type == 39u || type == 16u || QWEN4_Q2K(type)) ? 2 : 0;
     return strtol(v, NULL, 10);
 }
 static uint32_t qwen4_moe_mm_nax(uint32_t type) {
     if (!ds4_gpu_mpp_available()) return 0;
-    if (!(type == 12u || type == 39u || type == 16u || type == 10u)) return 0;
+    if (!(type == 12u || type == 39u || type == 16u || QWEN4_Q2K(type))) return 0;
     const long n = qwen4_moe_mm_nax_level(type);
     if (n <= 0) return 0;
     return (n == 1 || n == 4 || n == 6) ? 32u : 64u;
@@ -49864,7 +49867,7 @@ static bool qwen4_moe_mm_tails(uint32_t type, uint32_t nt) {
      * for Q4_K gate/up with MXFP4 down. */
     const int override = ds4_gpu_env_bool("DS4_QWEN4_MOE_TAILS");
     return nt > 1u && (override >= 0 ? override != 0 :
-        ((type == 16u || type == 10u) && ds4_gpu_device_name_contains("M3 Ultra")) ||
+        ((type == 16u || QWEN4_Q2K(type)) && ds4_gpu_device_name_contains("M3 Ultra")) ||
         ((type == 12u || type == 39u) && ds4_gpu_device_is_m5_apple_silicon()));
 }
 
@@ -49969,7 +49972,7 @@ int ds4_gpu_qwen4_moe_mm_down_tensor(
     if (tails) args.tail_base = nt * 8u;
     qwen4_bind b[6];
     if (n_tokens == 0 || n_slots == 0 || n_out < n_slots || row_bytes == 0 ||
-        (weight_type != 8u && weight_type != 39u && weight_type != 12u && weight_type != 10u && weight_type != 16u && weight_type != 2u) ||
+        (weight_type != 8u && weight_type != 39u && weight_type != 12u && weight_type != 10u && weight_type != 40u && weight_type != 16u && weight_type != 2u) ||
         (ff_dim % 64) != 0 || out_dim == 0 || n_expert == 0 || n_expert > 512 ||
         !qwen4_bind_weight(&b[0], model_map, model_size, down_offset, expert_bytes * n_expert, "moe down experts") ||
         !qwen4_bind_tensor(&b[1], lists, (uint64_t)n_expert * list_cap * sizeof(int32_t), "moe lists") ||
