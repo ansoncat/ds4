@@ -49074,9 +49074,9 @@ int ds4_gpu_qwen4_attn_prep_tensor(
         float rope_base, float eps) {
     struct {
         uint32_t n_tokens, n_head, n_head_kv, head_dim, n_rot, n_idx_head, idx_dim, pos0, cache_cap;
-        float rope_base, eps; uint32_t pad0; float rope_mscale; float rope_freq[32];
+        float rope_base, eps; uint32_t ik_floats; float rope_mscale; float rope_freq[32];
     } args = { n_tokens, n_head, n_head_kv, head_dim, n_rot, n_idx_head, idx_dim, pos0, cache_cap,
-               rope_base, eps, 0, 1.0f, { 0 } };
+               rope_base, eps, (uint32_t)(ds4_gpu_tensor_bytes(ik_cache) / sizeof(float)), 1.0f, { 0 } };
     qwen4_rope_fill(args.rope_freq, &args.rope_mscale, n_rot, rope_base);
     const uint64_t q_bytes = (uint64_t)n_tokens * n_head * head_dim * sizeof(float);
     const uint64_t kv_bytes = (uint64_t)n_tokens * n_head_kv * head_dim * sizeof(float);
@@ -49102,7 +49102,8 @@ int ds4_gpu_qwen4_attn_prep_tensor(
         !qwen4_bind_tensor(&b[10], k_cache, cache_bytes, "k cache") ||
         !qwen4_bind_tensor(&b[11], v_cache, cache_bytes, "v cache") ||
         !qwen4_bind_tensor(&b[12], iq_out, iq_bytes, "indexer q") ||
-        !qwen4_bind_tensor(&b[13], ik_cache, (uint64_t)cache_cap * idx_dim * sizeof(float), "indexer k cache") ||
+        /* the key cache wraps at its own length; the caller sizes it */
+        !qwen4_bind_tensor(&b[13], ik_cache, (uint64_t)n_tokens * idx_dim * sizeof(float), "indexer k cache") ||
         !qwen4_bind_tensor(&b[14], pos3, (uint64_t)cache_cap * 16u, "rope positions")) {
         return 0;
     }
@@ -49115,14 +49116,19 @@ int ds4_gpu_qwen4_idx_block_key_tensor(
         const void *model_map, uint64_t model_size, uint64_t g_ik_offset,
         uint32_t block0, uint32_t n_blocks, uint32_t ratio, uint32_t idx_dim, uint32_t n_rot,
         float rope_base, float eps) {
-    struct { uint32_t block0, n_blocks, ratio, idx_dim, n_rot; float rope_base, eps; uint32_t pad0;
+    struct { uint32_t block0, n_blocks, ratio, idx_dim, n_rot; float rope_base, eps; uint32_t ik_floats;
              float rope_mscale; float rope_freq[32]; } args =
-        { block0, n_blocks, ratio, idx_dim, n_rot, rope_base, eps, 0, 1.0f, { 0 } };
+        { block0, n_blocks, ratio, idx_dim, n_rot, rope_base, eps,
+          (uint32_t)(ds4_gpu_tensor_bytes(ik_cache) / sizeof(float)), 1.0f, { 0 } };
     qwen4_rope_fill(args.rope_freq, &args.rope_mscale, n_rot, rope_base);
     const uint64_t n_keys = ((uint64_t)block0 + n_blocks) * ratio;
+    /* A key cache shorter than the positions wraps: whole blocks, and the
+     * ones built here must all still be in it. */
+    const uint64_t ik_rows = idx_dim ? args.ik_floats / idx_dim : 0;
     qwen4_bind b[4];
     if (n_blocks == 0 || ratio == 0 || idx_dim < 32 || idx_dim > 128 || (idx_dim % 32) != 0 || n_rot > idx_dim ||
-        !qwen4_bind_tensor(&b[0], ik_cache, n_keys * idx_dim * sizeof(float), "indexer k cache") ||
+        (ik_rows < n_keys && ik_rows % ratio != 0) ||
+        !qwen4_bind_tensor(&b[0], ik_cache, (uint64_t)n_blocks * ratio * idx_dim * sizeof(float), "indexer k cache") ||
         !qwen4_bind_weight(&b[1], model_map, model_size, g_ik_offset, (uint64_t)idx_dim * sizeof(float),
                            "indexer k_norm") ||
         !qwen4_bind_tensor(&b[2], pos3, n_keys * 16u, "rope positions") ||
@@ -49312,7 +49318,7 @@ int ds4_gpu_qwen4_attn_decode_tensor(
 
 typedef struct {
     uint64_t k_cache, v_cache, ik_cache, block_key, pos3;
-    uint32_t pos, n_blocks, use_sel, pad0;
+    uint32_t pos, n_blocks, use_sel, ik_floats;
 } qwen4_attn_row_entry;
 
 static uint64_t qwen4_tensor_address(const ds4_gpu_tensor *t) {
@@ -49337,7 +49343,7 @@ int ds4_gpu_qwen4_attn_rows_stage(ds4_gpu_tensor *table, uint64_t entry0,
         e[i].pos = rows[i].pos;
         e[i].n_blocks = (rows[i].pos + 1u) / ratio;
         e[i].use_sel = rows[i].use_sel ? 1u : 0u;
-        e[i].pad0 = 0u;
+        e[i].ik_floats = (uint32_t)(ds4_gpu_tensor_bytes(rows[i].ik_cache) / sizeof(float));
     }
     return ds4_gpu_tensor_write(table, entry0 * sizeof(e[0]), e, (uint64_t)n_rows * sizeof(e[0]));
 }
