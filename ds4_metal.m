@@ -48480,6 +48480,7 @@ static uint32_t qwen4_expert_row_bytes(uint32_t weight_type, uint32_t in_dim) {
     case 12u: return (in_dim % 256u) ? 0u : (in_dim / 256u) * 144u;   /* q4_K */
     case 10u: return (in_dim % 256u) ? 0u : (in_dim / 256u) * 84u;    /* q2_K */
     case 40u: return in_dim == 640u ? 212u : 0u;   /* q2_K, last block cut to its used half */
+    case 41u: return in_dim == 640u ? 166u : 0u;   /* iq2_xxs, last block cut to its used half */
     case 16u: return (in_dim % 256u) ? 0u : (in_dim / 256u) * 66u;    /* iq2_xxs */
     case 39u: return (in_dim / 32u) * 17u;   /* mxfp4 */
     case 2u:  return (in_dim / 32u) * 18u;   /* q4_0 */
@@ -49600,6 +49601,7 @@ int ds4_gpu_qwen4_moe_down_tensor(
     const uint32_t weight_dim = weight_type == 10u ? (ff_dim + 255u) / 256u * 256u : ff_dim;
     const uint32_t row_bytes = qwen4_expert_row_bytes(weight_type, weight_dim);
     const uint64_t expert_bytes = (uint64_t)row_bytes * out_dim;
+    if (weight_type == 41u) weight_type = 16u;   /* the same blocks; the row only ends early */
     const bool has_shared = shared_type != UINT32_MAX;
     const uint32_t sh_row_bytes = has_shared ? qwen4_expert_row_bytes(shared_type, ff_dim) : 0u;
     const uint32_t n_out = n_slots + (has_shared ? 1u : 0u);
@@ -49967,6 +49969,7 @@ int ds4_gpu_qwen4_moe_mm_down_tensor(
     const uint32_t weight_dim = weight_type == 10u ? (ff_dim + 255u) / 256u * 256u : ff_dim;
     const uint32_t row_bytes = qwen4_expert_row_bytes(weight_type, weight_dim);
     const uint64_t expert_bytes = (uint64_t)row_bytes * out_dim;
+    if (weight_type == 41u) weight_type = 16u;   /* the same blocks; the row only ends early */
     const uint32_t tiles = qwen4_moe_mm_tiles(n_tokens, false);
     const uint32_t nt = qwen4_moe_mm_nt(n_tokens, weight_type, "DS4_QWEN4_MOE_DOWN_NT");
     const int kernel = nt == 1u ? QWEN4_K_MOE_MM_DOWN_NT1 :

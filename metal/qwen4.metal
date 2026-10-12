@@ -2672,9 +2672,11 @@ static inline float qwen4_row_dot(device const char *row, device const float *x,
     } else if (weight_type == 16) {
         /* iq2_xxs: 66-byte super-blocks of 256 (d, 8 x 4 u16: 4 grid bytes + 28 sign bits + 4-bit
          * scale per 32); lane owns one 8-value grid entry: sub-block = lane/4, entry = lane%4 */
-        const uint nb = in_dim / 256;
+        const uint nb = (in_dim + 255u) / 256u;
         const uint ib32 = tiisg / 4, j = tiisg % 4;
         for (uint ib = 0; ib < nb; ib++) {
+            /* A 640-wide down row ends inside its third block. */
+            if (ib * 256u + ib32 * 32u + j * 8u >= in_dim) continue;
             device const uchar *blk = (device const uchar *)(row + (uint64_t)ib * 66);
             const float d = (float)(*(device const half *)blk);
             device const ushort *q2 = (device const ushort *)(blk + 2) + 4 * ib32;

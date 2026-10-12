@@ -2363,6 +2363,9 @@ static const gguf_type_info gguf_types[] = {
     /* Local: a 640-wide Q2_K row, two blocks then the used half of a third
      * (8 scales, 32 qs bytes, d, dmin).  See gguf-tools/qwen4_q2k640.py. */
     [40] = {"q2_k640",640, 212},
+    /* Local: a 640-wide IQ2_XXS row, two blocks then d and the four used
+     * groups of a third.  See gguf-tools/qwen4_down_iq2.py. */
+    [41] = {"iq2_xxs640",640, 166},
 };
 
 enum {
@@ -2382,6 +2385,7 @@ enum {
     DS4_TENSOR_BF16     = 30,
     DS4_TENSOR_MXFP4    = 39,
     DS4_TENSOR_Q2_K640  = 40,
+    DS4_TENSOR_IQ2_XXS640 = 41,
 };
 
 typedef struct {
@@ -5004,6 +5008,7 @@ static bool tensor_is_routed_expert_type(uint32_t type) {
            type == DS4_TENSOR_IQ2_XXS ||
            type == DS4_TENSOR_Q2_K ||
            type == DS4_TENSOR_Q2_K640 ||
+           type == DS4_TENSOR_IQ2_XXS640 ||
            type == DS4_TENSOR_Q4_K ||
            type == DS4_TENSOR_Q5_K ||
            type == DS4_TENSOR_Q6_K ||
@@ -57690,13 +57695,14 @@ static bool qwen4_graph_dense_ok(const ds4_tensor *t) {
 /* expert types the tiled prefill GEMM stages (kernel_qwen4_moe_mm_*) */
 static bool qwen4_expert_type_has_mm(uint32_t type) {
     return type == DS4_TENSOR_Q8_0 || type == DS4_TENSOR_MXFP4 || type == DS4_TENSOR_Q4_K ||
-           type == DS4_TENSOR_Q2_K || type == DS4_TENSOR_Q2_K640 || type == DS4_TENSOR_IQ2_XXS;
+           type == DS4_TENSOR_Q2_K || type == DS4_TENSOR_Q2_K640 || type == DS4_TENSOR_IQ2_XXS ||
+           type == DS4_TENSOR_IQ2_XXS640;
 }
 
 static bool qwen4_graph_expert_ok(const ds4_tensor *t) {
     return t && (t->type == DS4_TENSOR_Q8_0 || t->type == DS4_TENSOR_MXFP4 || t->type == DS4_TENSOR_Q4_0 ||
                  t->type == DS4_TENSOR_F16 || t->type == DS4_TENSOR_BF16 || t->type == DS4_TENSOR_F32 ||
-                 (t->type == DS4_TENSOR_Q2_K640 && t->dim[0] == 640u) ||
+                 ((t->type == DS4_TENSOR_Q2_K640 || t->type == DS4_TENSOR_IQ2_XXS640) && t->dim[0] == 640u) ||
                  ((t->type == DS4_TENSOR_Q4_K || t->type == DS4_TENSOR_Q2_K || t->type == DS4_TENSOR_IQ2_XXS) &&
                   (t->dim[0] % 256u) == 0));
 }
@@ -60498,7 +60504,8 @@ static bool ds4_session_dspark_seed_batch_enabled(
            layer->ffn_gate_exps && layer->ffn_down_exps &&
            ((layer->ffn_gate_exps->type == DS4_TENSOR_IQ2_XXS &&
              (layer->ffn_down_exps->type == DS4_TENSOR_Q2_K ||
-              layer->ffn_down_exps->type == DS4_TENSOR_Q2_K640)) ||
+              layer->ffn_down_exps->type == DS4_TENSOR_Q2_K640 ||
+              layer->ffn_down_exps->type == DS4_TENSOR_IQ2_XXS640)) ||
             (e->tp.active && layer->ffn_gate_exps->type == DS4_TENSOR_MXFP4 &&
              layer->ffn_down_exps->type == DS4_TENSOR_MXFP4));
 }

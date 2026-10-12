@@ -22,6 +22,7 @@ from qwen4_pack_to_qwen4exp import Reader, kv_bytes, w_str
 
 SIZES = dict(BLOCKS)
 SIZES[40] = (640, 212)
+SIZES[41] = (640, 166)   # qwen4_down_iq2.py
 DOWN = re.compile(r'blk\.\d+\.ffn_down_exps\.weight')
 
 
@@ -43,7 +44,9 @@ def nocache(fp):
         fcntl.fcntl(fp.fileno(), fcntl.F_NOCACHE, 1)
 
 
-def repack(source, output):
+def repack(source, output, swap=None):
+    """swap: tensor name -> (type, dims, file holding its payload), written instead of the source tensor."""
+    swap = swap or {}
     row = bytes(range(252))
     assert pack(row * 2) == (row[:176] + row[184:216] + row[248:]) * 2
     pending = Path(str(output) + '.incomplete')
@@ -55,16 +58,19 @@ def repack(source, output):
             raise ValueError('Expected a qwen4exp GGUF')
         alignment = model.kv.get('general.alignment', 32)
         align = lambda n, a=alignment: (n + a - 1) // a * a
-        plan, offset, packed = [], 0, 0   # name, kind, dims, new offset, old size, old offset
+        plan, offset, packed = [], 0, 0   # name, kind, dims, new offset, old size, old offset, pack?
         for name, (kind, dims, old) in model.tensors.items():
             if name == NGRAM:
                 continue
             size, new_kind, new_dims = size_of(kind, dims), kind, dims
-            if DOWN.fullmatch(name) and kind == 10 and dims[0] == 768:
+            pad = DOWN.fullmatch(name) and kind == 10 and dims[0] == 768 and name not in swap
+            if name in swap:
+                new_kind, new_dims = swap[name][:2]
+            elif pad:
                 new_kind, new_dims, packed = 40, [640] + dims[1:], packed + 1
-            plan.append((name, new_kind, new_dims, offset, size, old))
+            plan.append((name, new_kind, new_dims, offset, size, old, pad))
             offset = align(offset + size_of(new_kind, new_dims))
-        if not packed or NGRAM not in model.tensors:
+        if not (packed or swap) or NGRAM not in model.tensors:
             raise ValueError('No padded Q2_K down experts or no n-gram table to repack')
         ngram_kind, ngram_dims, ngram_old = model.tensors[NGRAM]
         ngram_size = size_of(ngram_kind, ngram_dims)
@@ -91,11 +97,16 @@ def repack(source, output):
         with pending.open('xb') as dst:
             nocache(dst)
             dst.write(header(table_start - data_start))
-            for name, kind, dims, pos, size, old in plan:
+            for name, kind, dims, pos, size, old, pad in plan:
                 dst.seek(data_start + pos)
                 model.f.seek(model.data_start + old)
                 src = model.f
-                if kind == 40:
+                if name in swap:
+                    size = size_of(kind, dims)
+                    if swap[name][2].stat().st_size != size:
+                        raise ValueError('Replacement payload has the wrong size: ' + name)
+                    src = swap[name][2].open('rb')
+                elif pad:
                     raw = model.f.read(size)
                     if len(raw) != size:
                         raise ValueError('Truncated tensor payload')
@@ -117,7 +128,7 @@ def repack(source, output):
                 if copy_hash(check, None, size) != digest:
                     raise ValueError('Output payload verification failed: ' + name)
         pending.rename(output)
-        print(f'Verified {output}: {total} bytes, {packed} tensors packed, '
+        print(f'Verified {output}: {total} bytes, {packed} tensors packed, {len(swap)} replaced, '
               f'{source.stat().st_size - total} bytes smaller', flush=True)
     finally:
         model.f.close()
