@@ -19877,8 +19877,15 @@ static int ds4_gpu_matmul_quant_impl_tensor(
             (in_dim % 256u) == 0 &&
             getenv("DS4_METAL_DISABLE_Q4_MV_CLASSIC") == NULL) {
             const int16_t nsg = 2;
+            /* 2-4 tokens (an MTP verify): the multi-token variant streams each weight row once for all of them
+             * (local, llm-infra TODO 96; DS4_METAL_DISABLE_Q4_MV_MT=1 keeps one token per threadgroup row). */
+            static int no_mt = -1;
+            if (no_mt < 0) no_mt = getenv("DS4_METAL_DISABLE_Q4_MV_MT") != NULL;
+            const bool mt = !no_mt && n_tok >= 2u && n_tok <= 4u;
+            static const char *const mt_names[5] = { NULL, NULL, "kernel_mul_mv_q4_K_dense_mt2_f32",
+                                                     "kernel_mul_mv_q4_K_dense_mt3_f32", "kernel_mul_mv_q4_K_dense_mt4_f32" };
             id<MTLComputePipelineState> pipeline =
-                ds4_gpu_get_mul_mv_ext_pipeline("kernel_mul_mv_q4_K_dense_f32", nsg, 8);
+                ds4_gpu_get_mul_mv_ext_pipeline(mt ? mt_names[n_tok] : "kernel_mul_mv_q4_K_dense_f32", nsg, 8);
             if (pipeline) {
                 ds4_gpu_q8_0_matvec_args args = {
                     .ne00 = (int32_t)in_dim,
@@ -19911,7 +19918,7 @@ static int ds4_gpu_matmul_quant_impl_tensor(
                 [enc setBuffer:outbuf offset:ds4_gpu_tensor_offset(out) atIndex:3];
                 [enc setThreadgroupMemoryLength:32 atIndex:0];
                 [enc dispatchThreadgroups:MTLSizeMake(((NSUInteger)out_dim + rows_ptg - 1u) / rows_ptg,
-                                                      (NSUInteger)n_tok,
+                                                      mt ? 1u : (NSUInteger)n_tok,
                                                       1)
                      threadsPerThreadgroup:MTLSizeMake(32, (NSUInteger)nsg, 1)];
                 ds4_gpu_end_compute_encoder(cb, enc);

@@ -3381,6 +3381,121 @@ kernel void kernel_mul_mv_q4_K_dense_f32(
     kernel_mul_mv_q4_K_f32_impl<N_R0_Q4_K>(args, src0, src1, dst, shmem, tgpig, tiisg, sgitg);
 }
 
+// Multi-token dense Q4_K matvec (local, llm-infra TODO 96).  The classic kernel above takes one token per
+// threadgroup row (tgpig.y), so an MTP verify of T tokens streams every weight row T times; on Flash-Next's
+// decode shapes T = 3 cost as much as Q8_0 (which reads its rows once for all tokens).  This variant keeps the
+// same lane layout and per-token arithmetic order but loads each weight word once and applies it to NT tokens.
+// Weights go to registers first and tokens stream through one at a time (holding all NT tokens' activations
+// at once spilled registers: 2.3x slower than the classic kernel in the first try).
+// Dispatch with grid.y = 1 and args.ne11 == NT.
+template<int nr0, int NT>
+void kernel_mul_mv_q4_K_mt_f32_impl(
+        constant ds4_metal_args_mul_mv & args,
+        device const char *src0,
+        device const char *src1,
+        device       char *dst,
+        uint3  tgpig,
+        ushort tiisg,
+        ushort sgitg) {
+    const short NSG = FC_mul_mv_nsg;
+
+    constexpr uint16_t kmask1 = 0x3f3f;
+    constexpr uint16_t kmask2 = 0x0f0f;
+    constexpr uint16_t kmask3 = 0xc0c0;
+
+    const short ix = tiisg / 8;
+    const short it = tiisg % 8;
+    const short iq = it / 4;
+    const short ir = it % 4;
+
+    const int nb = args.ne00 / QK_K;
+    const int first_row = (tgpig.x * NSG + sgitg) * nr0;
+
+    device const block_q4_K *x = (device const block_q4_K *)(src0 + (uint64_t)first_row * args.nb01);
+
+    float sumf[nr0][NT];
+    for (short row = 0; row < nr0; row++) for (short t = 0; t < NT; t++) sumf[row][t] = 0.f;
+
+    uint16_t sc16[4];
+    thread const uint8_t *sc8 = (thread const uint8_t *)sc16;
+
+    for (int ib = ix; ib < nb; ib += 4) {
+        /* this lane's weight words and scales for every row first (a few registers per row) ... */
+        uint16_t a[nr0][4], b[nr0][4];
+        uint8_t s8[nr0][8];
+        float d[nr0], dmin[nr0];
+        {
+            device const uint16_t *sc = (device const uint16_t *)x[ib].scales + iq;
+            device const uint16_t *q1 = (device const uint16_t *)x[ib].qs + 16 * iq + 4 * ir;
+            device const half *dh = &x[ib].d;
+            for (short row = 0; row < nr0; row++) {
+                sc16[0] = sc[0] & kmask1;
+                sc16[1] = sc[2] & kmask1;
+                sc16[2] = ((sc[4] >> 0) & kmask2) | ((sc[0] & kmask3) >> 2);
+                sc16[3] = ((sc[4] >> 4) & kmask2) | ((sc[2] & kmask3) >> 2);
+                for (short k = 0; k < 8; k++) s8[row][k] = sc8[k];
+                d[row] = dh[0]; dmin[row] = dh[1];
+                FOR_UNROLL (short i = 0; i < 4; ++i) { a[row][i] = q1[i]; b[row][i] = q1[i + 32]; }
+                q1 += args.nb01 / 2;
+                sc += args.nb01 / 2;
+                dh += args.nb01 / 2;
+            }
+        }
+        /* ... then one token's 32 activations at a time against all of them */
+        for (short t = 0; t < NT; t++) {
+            device const float *y4 = (device const float *)(src1 + (uint64_t)t * args.nb11) +
+                                     ib * QK_K + 64 * iq + 8 * ir;
+            float yl[16], yh[16];
+            float4 sumy = {0.f, 0.f, 0.f, 0.f};
+            for (short i = 0; i < 8; ++i) {
+                yl[i + 0] = y4[i +   0]; sumy[0] += yl[i + 0];
+                yl[i + 8] = y4[i +  32]; sumy[1] += yl[i + 8];
+                yh[i + 0] = y4[i + 128]; sumy[2] += yh[i + 0];
+                yh[i + 8] = y4[i + 160]; sumy[3] += yh[i + 8];
+            }
+            for (short row = 0; row < nr0; row++) {
+                float4 acc1 = {0.f, 0.f, 0.f, 0.f};
+                float4 acc2 = {0.f, 0.f, 0.f, 0.f};
+                FOR_UNROLL (short i = 0; i < 4; ++i) {
+                    acc1[0] += yl[2 * i + 0] * (a[row][i] & 0x000F);
+                    acc1[1] += yl[2 * i + 1] * (a[row][i] & 0x0F00);
+                    acc1[2] += yl[2 * i + 8] * (a[row][i] & 0x00F0);
+                    acc1[3] += yl[2 * i + 9] * (a[row][i] & 0xF000);
+                    acc2[0] += yh[2 * i + 0] * (b[row][i] & 0x000F);
+                    acc2[1] += yh[2 * i + 1] * (b[row][i] & 0x0F00);
+                    acc2[2] += yh[2 * i + 8] * (b[row][i] & 0x00F0);
+                    acc2[3] += yh[2 * i + 9] * (b[row][i] & 0xF000);
+                }
+                const thread uint8_t *q8 = s8[row];
+                sumf[row][t] += d[row] * ((acc1[0] + 1.f / 256.f * acc1[1]) * q8[0] +
+                                          (acc1[2] + 1.f / 256.f * acc1[3]) * q8[1] * 1.f / 16.f +
+                                          (acc2[0] + 1.f / 256.f * acc2[1]) * q8[4] +
+                                          (acc2[2] + 1.f / 256.f * acc2[3]) * q8[5] * 1.f / 16.f) -
+                                dmin[row] * (sumy[0] * q8[2] + sumy[1] * q8[3] + sumy[2] * q8[6] + sumy[3] * q8[7]);
+            }
+        }
+    }
+
+    for (short t = 0; t < NT; t++) {
+        device float *dst_f32 = (device float *)dst + (uint64_t)t * args.ne0;
+        for (int row = 0; row < nr0 && first_row + row < args.ne0; ++row) {
+            const float sum_all = simd_sum(sumf[row][t]);
+            if (tiisg == 0) dst_f32[first_row + row] = sum_all;
+        }
+    }
+}
+
+#define DS4_Q4K_MT(NT) \
+kernel void kernel_mul_mv_q4_K_dense_mt##NT##_f32( \
+        constant ds4_metal_args_mul_mv & args, device const char * src0, device const char * src1, \
+        device char * dst, threadgroup char * shmem [[threadgroup(0)]], uint3 tgpig[[threadgroup_position_in_grid]], \
+        ushort tiisg[[thread_index_in_simdgroup]], ushort sgitg[[simdgroup_index_in_threadgroup]]) { \
+    (void)shmem; kernel_mul_mv_q4_K_mt_f32_impl<N_R0_Q4_K, NT>(args, src0, src1, dst, tgpig, tiisg, sgitg); \
+}
+DS4_Q4K_MT(2)
+DS4_Q4K_MT(3)
+DS4_Q4K_MT(4)
+
 // DS4 attention output low projection, specialized for the fixed block
 // diagonal mapping used by the model:
 //
