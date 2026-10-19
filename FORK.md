@@ -36,7 +36,16 @@ Q2.gguf ──qwen4_down_iq2.py convert──▶ Q2-downiq2.gguf
         ──qwen4_dense_q4k.py────────▶ Q2-downiq2-denseq4k.gguf
         ──qwen4_hc_q8.py────────────▶ Q2-downiq2-denseq4k-hcq8.gguf   ← 線上用這個
 ```
-轉檔工具要 `make quants-shared` 產生的 `gguf-tools/libds4quants.dylib`。
+完整指令（在 repo 根目錄執行；Python 要有 numpy，`--selftest` 另外要 gguf-py）：
+```sh
+make -C gguf-tools quants-shared          # 產生 gguf-tools/libds4quants.dylib（量化器，三支工具共用）
+M=~/models/ds4-gguf
+python3 gguf-tools/qwen4_down_iq2.py convert --model $M/Qwen3.8-Flash-Next-Q2.gguf --out $M/Qwen3.8-Flash-Next-Q2-downiq2.gguf
+python3 gguf-tools/qwen4_dense_q4k.py --model $M/Qwen3.8-Flash-Next-Q2-downiq2.gguf --out $M/Qwen3.8-Flash-Next-Q2-downiq2-denseq4k.gguf
+python3 gguf-tools/qwen4_hc_q8.py     --model $M/Qwen3.8-Flash-Next-Q2-downiq2-denseq4k.gguf --out $M/Qwen3.8-Flash-Next-Q2-downiq2-denseq4k-hcq8.gguf
+```
+第一步會下載 BF16 down_proj 與 imatrix（約 75 GiB），做完自己清掉中間檔；後兩步各寫一個約 130–140 GiB 的新檔，中間的 `denseq4k` 檔做完可以刪。
+第一步的輸出驗證過和線上檔逐位元組相同；後兩步是用同一套工具產生線上檔，但沒有從頭重跑比對過。
 
 ```sh
 DS4_METAL_NO_RESIDENCY=1 DS4_QWEN4_HC_Q8_GEMM=1 ./ds4-server \
