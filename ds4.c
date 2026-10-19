@@ -58429,8 +58429,10 @@ static bool qwen4_graph_hc_mix(ds4_qwen4_gpu_graph *g, const ds4_model *m,
                                            inject ? inject->abs_offset : 0, inject ? inject->type : DS4_TENSOR_F32,
                                            T, DS4_N_EMBD, DS4_N_HC, inject ? DS4_N_HC : 0u, DS4_RMS_EPS) &&
               qwen4_gemv(g->lo, m, down, g->xn, T);
+    static int q8_gemm = -1;   /* local probe (llm-infra TODO 96): let Q8_0 hc up take the prefill GEMM too */
+    if (q8_gemm < 0) q8_gemm = getenv("DS4_QWEN4_HC_Q8_GEMM") != NULL;
     if (T > 8u &&
-        up->type != DS4_TENSOR_Q8_0) {
+        (up->type != DS4_TENSOR_Q8_0 || q8_gemm)) {
         /* prefill: the up projection as a GEMM over the activated low-rank rows */
         return ok && ds4_gpu_qwen4_hc_lo_act_tensor(g->hc_lo_act, g->lo, T, DS4_N_HC, DS4_N_HC_LOWRANK) &&
                qwen4_gemv(g->hc_u, m, up, g->hc_lo_act, T) &&
