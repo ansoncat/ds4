@@ -38,7 +38,11 @@ Q2.gguf ──qwen4_down_iq2.py convert──▶ Q2-downiq2.gguf
         ──qwen4_dense_q4k.py────────▶ Q2-downiq2-denseq4k.gguf
         ──qwen4_hc_q8.py────────────▶ Q2-downiq2-denseq4k-hcq8.gguf   ← the one in use
 ```
-Commands (run from the repo root; Python needs numpy, and `--selftest` also needs gguf-py):
+The converted file is on Hugging Face as
+[ansoncat/qwen3.8-flash-next-ds4-gguf](https://huggingface.co/ansoncat/qwen3.8-flash-next-ds4-gguf)
+(`Qwen3.8-Flash-Next-Q2-IQ2down-Q4Kdense-Q8hc.gguf`, the same bytes as `Q2-downiq2-denseq4k-hcq8.gguf` below).
+
+To build it yourself instead (run from the repo root; Python needs numpy, and `--selftest` also needs gguf-py):
 ```sh
 make -C gguf-tools quants-shared          # builds gguf-tools/libds4quants.dylib, the quantizer all three tools use
 M=~/models/ds4-gguf

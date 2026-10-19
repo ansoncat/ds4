@@ -38,7 +38,11 @@ Q2.gguf ──qwen4_down_iq2.py convert──▶ Q2-downiq2.gguf
         ──qwen4_dense_q4k.py────────▶ Q2-downiq2-denseq4k.gguf
         ──qwen4_hc_q8.py────────────▶ Q2-downiq2-denseq4k-hcq8.gguf   ← 線上用這個
 ```
-完整指令（在 repo 根目錄執行；Python 要有 numpy，`--selftest` 另外要 gguf-py）：
+轉好的檔案放在 Hugging Face：
+[ansoncat/qwen3.8-flash-next-ds4-gguf](https://huggingface.co/ansoncat/qwen3.8-flash-next-ds4-gguf)
+（`Qwen3.8-Flash-Next-Q2-IQ2down-Q4Kdense-Q8hc.gguf`，和下面的 `Q2-downiq2-denseq4k-hcq8.gguf` 逐位元組相同）。
+
+要自己轉的完整指令（在 repo 根目錄執行；Python 要有 numpy，`--selftest` 另外要 gguf-py）：
 ```sh
 make -C gguf-tools quants-shared          # 產生 gguf-tools/libds4quants.dylib（量化器，三支工具共用）
 M=~/models/ds4-gguf
