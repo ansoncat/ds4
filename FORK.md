@@ -45,7 +45,7 @@ python3 gguf-tools/qwen4_dense_q4k.py --model $M/Qwen3.8-Flash-Next-Q2-downiq2.g
 python3 gguf-tools/qwen4_hc_q8.py     --model $M/Qwen3.8-Flash-Next-Q2-downiq2-denseq4k.gguf --out $M/Qwen3.8-Flash-Next-Q2-downiq2-denseq4k-hcq8.gguf
 ```
 第一步會下載 BF16 down_proj 與 imatrix（約 75 GiB），做完自己清掉中間檔；後兩步各寫一個約 130–140 GiB 的新檔，中間的 `denseq4k` 檔做完可以刪。
-第一步的輸出驗證過和線上檔逐位元組相同；後兩步是用同一套工具產生線上檔，但沒有從頭重跑比對過。
+三步都驗證過：用這個分支的工具重轉，輸出和線上檔逐位元組相同（第一步 2026-10-12、後兩步 2026-10-19，各約 9 分鐘）。少了 `libds4quants.dylib` 時三支工具都會自己 `make`。
 
 ```sh
 DS4_METAL_NO_RESIDENCY=1 DS4_QWEN4_HC_Q8_GEMM=1 ./ds4-server \

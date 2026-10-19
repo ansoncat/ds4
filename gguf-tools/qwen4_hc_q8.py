@@ -16,6 +16,7 @@ import ctypes
 from pathlib import Path
 import re
 import shutil
+import subprocess
 
 import numpy as np
 
@@ -29,6 +30,8 @@ LIB = Path(__file__).with_name('libds4quants.dylib')
 
 
 def quantizer():
+    if not LIB.exists():   # same as qwen4_down_iq2.py
+        subprocess.run(['make', '-C', str(LIB.parent), 'quants-shared'], check=True)
     lib = ctypes.CDLL(str(LIB))
     lib.ds4q_quantize_chunk.argtypes = [ctypes.c_int, ctypes.POINTER(ctypes.c_float), ctypes.c_void_p,
                                         ctypes.c_int64, ctypes.c_int64, ctypes.c_int64, ctypes.POINTER(ctypes.c_float)]
