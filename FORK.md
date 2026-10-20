@@ -33,7 +33,7 @@ and the Metal backend only and have not been sent upstream. Measurements and dec
 ## Current setup (since 2026-10-19)
 
 The converted file is on Hugging Face:
-[ansoncat/qwen3.8-flash-next-ds4-gguf](https://huggingface.co/ansoncat/qwen3.8-flash-next-ds4-gguf)
+[ansoncat/qwen3.8-flash-next-ds4-64gb-mac-gguf](https://huggingface.co/ansoncat/qwen3.8-flash-next-ds4-64gb-mac-gguf)
 (`Qwen3.8-Flash-Next-Q2-IQ2down-Q4Kdense-Q8hc.gguf`).
 
 ### Build and run

@@ -33,7 +33,7 @@ Qwen3.8-Flash-Next Q2（262K context，供 Claude Code 經 llama-swap 使用）�
 ## 目前跑法（2026-10-19 起）
 
 轉好的檔案放在 Hugging Face：
-[ansoncat/qwen3.8-flash-next-ds4-gguf](https://huggingface.co/ansoncat/qwen3.8-flash-next-ds4-gguf)
+[ansoncat/qwen3.8-flash-next-ds4-64gb-mac-gguf](https://huggingface.co/ansoncat/qwen3.8-flash-next-ds4-64gb-mac-gguf)
 （`Qwen3.8-Flash-Next-Q2-IQ2down-Q4Kdense-Q8hc.gguf`）。
 
 ### 編譯與啟動
