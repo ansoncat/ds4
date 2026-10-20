@@ -29,8 +29,9 @@ Qwen3.8-Flash-Next Q2（262K context，供 Claude Code 經 llama-swap 使用）�
 | 5d7c601 | qwen4 dense 檢查接受 Q4_K，改走 GLM 的 Q4_K dense matvec；`gguf-tools/qwen4_dense_q4k.py` |
 | 26968d9 | 2–4 token 的 Q4_K matvec（MTP 驗證時權重只讀一次）；`gguf-tools/qwen4_hc_q8.py`（每層的 hyper-connection 低秩矩陣 F16→Q8_0）；`tests/bench_qwen4_dense.c` |
 | 07e6470 | `DS4_QWEN4_HC_Q8_GEMM=1`：讓 Q8_0 的 `hc_*_up` 在 prefill 也走 GEMM |
+| c3b08cb | IQ2_XXS routed expert 的 decode kernel（`kernel_qwen4_moe_{mid,down}_iq2_*`）：activation 讀一次供 gate／up 與多個 row 共用、down 的權重讀取全部提前。輸出與通用路徑逐位元相同；decode +8–16%。M5 預設開，`DS4_QWEN4_MOE_IQ2=0` 關；`tests/bench_qwen4_moe.c` |
 
-## 目前跑法（2026-10-19 起）
+## 目前跑法（檔案 2026-10-19 起、expert kernel 2026-10-21 起）
 
 轉好的檔案放在 Hugging Face：
 [ansoncat/qwen3.8-flash-next-ds4-64gb-mac-gguf](https://huggingface.co/ansoncat/qwen3.8-flash-next-ds4-64gb-mac-gguf)
@@ -105,19 +106,23 @@ python3 gguf-tools/qwen4_hc_q8.py     --model $M/Qwen3.8-Flash-Next-Q2-downiq2-d
 
 | | decode | prefill |
 |---|---|---|
-| 8K token 的 prompt | 46 | 528 |
-| 32K token 的 prompt | 45 | 544 |
-| 16K token 的程式碼 prompt | 42 | — |
-| 短 prompt（程式碼／散文／開 thinking） | 43／35／36 | — |
-| 262K 灌滿（260K token 的 prompt） | 35 | 545（整段平均） |
+| 8K token 的 prompt | 51 | 550 |
+| 32K token 的 prompt | 51 | 563 |
+| 16K token 的程式碼 prompt | 47 | 564 |
+| 短 prompt（程式碼／散文／開 thinking） | 57／45／45 | — |
+| 262K 灌滿（260K token 的 prompt，c3b08cb 之前） | 35 | 545（整段平均） |
 
+- 前四列是 2026-10-21 對 07e6470 的同場次對照（同一個檔，A B B A A B B A，中位數）：decode 8K 46.8 → 51.2、
+  32K 45.6 → 50.8、16K 程式碼 43.2 → 47.4、程式碼 49.7 → 57.4、散文 41.4 → 44.6、開 thinking 39.2 → 45.4；
+  prefill 不變（prefill 走別的 kernel）。greedy 輸出逐字相同。
 - 灌滿那一列是 2026-10-20 另一場次量的（`IQ2down` 在同條件是 prefill 469、decode 約 28，跨場次，不算乾淨的對照）。
 - 對上一版檔案（只有 `IQ2down`）：長 context decode +10–13%（8K 41.0 → 46.1、32K 40.7 → 44.8、16K 程式碼 37.4 → 42.2），
   prefill 不變。那一輪短 prompt 雜訊太大，不引用。
 - 上面那些記憶體補丁都不影響速度（輸出逐字相同、decode 差在 ±0.5% 內）。`--prefill-chunk` 用 1024 而不是 2048，
   是拿約 10% 的 prefill 速度換約 1 GiB 記憶體。
 - agentic（Claude Code，3 題各 3 次）：每一步都 9/9；最終檔對 `IQ2down` 牆鐘 −5%。
-- 這台機器上 ds4 decode 卡在記憶體頻寬：藏 SSD 延遲、提高 MTP 接受率都沒效果，只有每個 token 少讀位元組才會變快。
+- 這台機器上 decode 時 GPU 約 96% 時間在忙，所以藏 SSD 延遲、提高 MTP 接受率都沒效果。c3b08cb 之前兩顆 IQ2_XXS
+  expert kernel 佔每步約 40%、頻寬只有 53–77 GB/s（dense Q4_K 約 250）；這次的加速來自把它們寫有效率，不是少讀位元組。
 
 ### 品質
 

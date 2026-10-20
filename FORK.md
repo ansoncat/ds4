@@ -29,8 +29,9 @@ and the Metal backend only and have not been sent upstream. Measurements and dec
 | 5d7c601 | The qwen4 dense validator accepts Q4_K, which then uses GLM's Q4_K dense matvec; `gguf-tools/qwen4_dense_q4k.py` |
 | 26968d9 | Q4_K matvec for 2–4 tokens (MTP verify reads the weights once); `gguf-tools/qwen4_hc_q8.py` (per-layer hyper-connection low-rank tensors F16 → Q8_0); `tests/bench_qwen4_dense.c` |
 | 07e6470 | `DS4_QWEN4_HC_Q8_GEMM=1` routes Q8_0 `hc_*_up` tensors through the prefill GEMM path as well |
+| c3b08cb | IQ2_XXS routed expert decode kernels (`kernel_qwen4_moe_{mid,down}_iq2_*`): one activation read shared by gate/up and several rows, down-row reads issued up front. Bit-identical to the generic rows; decode +8–16%. Default on M5, `DS4_QWEN4_MOE_IQ2=0` turns it off; `tests/bench_qwen4_moe.c` |
 
-## Current setup (since 2026-10-19)
+## Current setup (file since 2026-10-19, expert kernels since 2026-10-21)
 
 The converted file is on Hugging Face:
 [ansoncat/qwen3.8-flash-next-ds4-64gb-mac-gguf](https://huggingface.co/ansoncat/qwen3.8-flash-next-ds4-64gb-mac-gguf)
@@ -108,20 +109,24 @@ Final setup, single user, `--mtp`, prompt cache not hit:
 
 | | Decode | Prefill |
 |---|---|---|
-| 8K-token prompt | 46 | 528 |
-| 32K-token prompt | 45 | 544 |
-| 16K-token code prompt | 42 | — |
-| Short prompts (code / prose / with thinking) | 43 / 35 / 36 | — |
-| Full 262K context (260K-token prompt) | 35 | 545 (average over the whole prompt) |
+| 8K-token prompt | 51 | 550 |
+| 32K-token prompt | 51 | 563 |
+| 16K-token code prompt | 47 | 564 |
+| Short prompts (code / prose / with thinking) | 57 / 45 / 45 | — |
+| Full 262K context (260K-token prompt, before c3b08cb) | 35 | 545 (average over the whole prompt) |
 
+- The first four rows are from the 2026-10-21 round against 07e6470 (same file, A B B A A B B A, medians): decode
+  8K 46.8 → 51.2, 32K 45.6 → 50.8, 16K code 43.2 → 47.4, code 49.7 → 57.4, prose 41.4 → 44.6, thinking 39.2 → 45.4;
+  prefill unchanged (prefill uses other kernels). Greedy outputs are identical byte for byte.
 - The full-context row was measured on 2026-10-20 in a different session from the rest (`IQ2down` in that setting: 469 prefill, about 28 decode, cross-session, so not a clean comparison).
 - Changes against the previous file (`IQ2down` only): long-context decode +10–13% (8K 41.0 → 46.1, 32K 40.7 → 44.8,
   16K code 37.4 → 42.2), prefill unchanged. Short prompts are too noisy in that round to quote.
 - The memory patches above leave speed unchanged (outputs identical, decode within ±0.5%). `--prefill-chunk 1024`
   instead of 2048 trades about 10% of prefill speed for about 1 GiB of memory.
 - Agentic coding (Claude Code, 3 fixtures × 3 runs): 9/9 in every step; wall time −5% for the final file against `IQ2down`.
-- On this machine ds4 decode is memory-bandwidth bound: hiding SSD latency or raising MTP acceptance does nothing;
-  only reading fewer bytes per token makes it faster.
+- On this machine the GPU is busy ~96% of a decode step, so hiding SSD latency or raising MTP acceptance does nothing.
+  Before c3b08cb the two IQ2_XXS expert kernels took ~40% of a step at only 53–77 GB/s (dense Q4_K runs at ~250);
+  making those kernels efficient is what the last speedup came from, not reading fewer bytes.
 
 ### Quality
 
