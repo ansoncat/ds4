@@ -82,10 +82,54 @@ python3 gguf-tools/qwen4_hc_q8.py     --model $M/Qwen3.8-Flash-Next-Q2-downiq2-d
 - All three steps are verified: re-running them with this branch's tools reproduces the files in use byte for byte
   (step 1 on 2026-10-12, steps 2–3 on 2026-10-19).
 
-## Measured (M5 Pro 64 GB, same-session comparisons)
+## Measured (M5 Pro 64 GB)
 
-- The last three commits with the final file, against `0a3d8ef` with the downiq2 file: long-context decode +10–13%,
-  prefill unchanged, about 2 GiB less wired memory; agentic 9/9 vs 9/9, HumanEval+ 151 vs 149, BFCL 516 vs 492, and the
-  rate of Simplified characters leaking into Traditional Chinese answers within noise.
+Every step was measured against the step before it in the same session (the speed of this machine drifts between sessions).
+
+### Memory (whole-machine wired memory, `--ctx 262144 --prefill-chunk 1024`)
+
+| Step | ~9K-token conversation | Full 262K context |
+|---|---|---|
+| Upstream ds4 + official Q2 | the full 262K KV (about 8 GiB) is wired as soon as it is used | 55.0–55.7 GiB |
+| d0d204c attention caches grow with the context | 47.5 GiB | unchanged |
+| 6851c1e token table out of the Metal view | 46.2 | 54.1 |
+| 35da5e9 down experts without row padding | 43.7 | 51.6 |
+| 737717f + 5fe6907 indexer ring buffer | 43.5 | 50.2 |
+| 0a3d8ef down experts as IQ2_XXS (`IQ2down`) | 40.7 | 47.2 |
+| 5d7c601–07e6470 + final file (`Q4Kdense`, `Q8hc`) | about 38 | not measured |
+
+- Idle (model loaded, no request): 42.2 → 4.0 GiB with `DS4_METAL_NO_RESIDENCY=1`.
+- Context: with `--prefill-chunk 1024`, upstream also fits a full 262K context on this machine (0–35 MB of swap);
+  this branch leaves about 8 GiB more headroom at full context and much more in normal-length conversations.
+
+### Speed (tokens per second)
+
+Final setup, single user, `--mtp`, prompt cache not hit:
+
+| | Decode | Prefill |
+|---|---|---|
+| 8K-token prompt | 46 | 528 |
+| 32K-token prompt | 45 | 544 |
+| 16K-token code prompt | 42 | — |
+| Short prompts (code / prose / with thinking) | 43 / 35 / 36 | — |
+| Full 262K context (measured before the last three commits) | 30–31 | about 480 |
+
+- Changes against the previous file (`IQ2down` only): long-context decode +10–13% (8K 41.0 → 46.1, 32K 40.7 → 44.8,
+  16K code 37.4 → 42.2), prefill unchanged. Short prompts are too noisy in that round to quote.
+- The memory patches above leave speed unchanged (outputs identical, decode within ±0.5%). `--prefill-chunk 1024`
+  instead of 2048 trades about 10% of prefill speed for about 1 GiB of memory.
+- Agentic coding (Claude Code, 3 fixtures × 3 runs): 9/9 in every step; wall time −5% for the final file against `IQ2down`.
 - On this machine ds4 decode is memory-bandwidth bound: hiding SSD latency or raising MTP acceptance does nothing;
   only reading fewer bytes per token makes it faster.
+
+### Quality
+
+| | official Q2 | `IQ2down` | final file |
+|---|---|---|---|
+| Agentic coding (3 fixtures × 3 runs) | 9/9 | 9/9 | 9/9 |
+| HumanEval+ base / plus (of 164, greedy, thinking off) | 156 / 152 | 154 / 149 | 156 / 151 |
+| BFCL simple_python + multiple (of 600, greedy, thinking off) | 522 | 492 | 516 |
+| Simplified characters in Traditional Chinese answers | 0.42% | 0.40% | within noise of `IQ2down` |
+
+`IQ2down` is the step that costs quality (BFCL −30, significant with thinking off; with thinking on 556 vs 567, not significant).
+These benchmarks do not cover long real-world sessions.

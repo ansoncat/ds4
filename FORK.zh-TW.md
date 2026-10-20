@@ -79,8 +79,53 @@ python3 gguf-tools/qwen4_hc_q8.py     --model $M/Qwen3.8-Flash-Next-Q2-downiq2-d
 - 少了 `gguf-tools/libds4quants.dylib` 時，三支工具都會自己跑 `make -C gguf-tools quants-shared`。
 - 三步都驗證過：用這個分支的工具重轉，輸出和線上檔逐位元組相同（第 1 步 2026-10-12、第 2–3 步 2026-10-19）。
 
-## 實測摘要（M5 Pro 64 GB，同場次對照）
+## 實測（M5 Pro 64 GB）
 
-- 最後三個 commit 加上最終檔，對比 `0a3d8ef`＋downiq2 檔：長 context decode +10–13%、prefill 不變、wired 少約 2 GiB；
-  agentic 9/9 對 9/9、HumanEval+ 151 對 149、BFCL 516 對 492、繁中簡體字比例差別在雜訊內。
+每一步都和前一步在同一場次對照（這台機器的速度跨場次會漂移）。
+
+### 記憶體（整機 wired，`--ctx 262144 --prefill-chunk 1024`）
+
+| 步驟 | 約 9K token 的對話 | 262K 灌滿 |
+|---|---|---|
+| 上游 ds4＋官方 Q2 | 262K 的 KV（約 8 GiB）一用到就整塊 wire | 55.0–55.7 GiB |
+| d0d204c attention cache 隨 context 成長 | 47.5 GiB | 不變 |
+| 6851c1e token 表移出 Metal 範圍 | 46.2 | 54.1 |
+| 35da5e9 down experts 去列尾 padding | 43.7 | 51.6 |
+| 737717f＋5fe6907 indexer 環狀緩衝區 | 43.5 | 50.2 |
+| 0a3d8ef down experts 改 IQ2_XXS（`IQ2down`） | 40.7 | 47.2 |
+| 5d7c601–07e6470＋最終檔（`Q4Kdense`、`Q8hc`） | 約 38 | 沒量 |
+
+- 閒置（模型已載入、沒有請求）：`DS4_METAL_NO_RESIDENCY=1` 讓 wired 從 42.2 降到 4.0 GiB。
+- context：用 `--prefill-chunk 1024` 的話，上游在這台機器上也塞得下 262K（swap 0–35 MB）；
+  這個分支在灌滿時多留約 8 GiB 餘裕，一般長度的對話餘裕更多。
+
+### 速度（tokens／秒）
+
+最終設定、單人、`--mtp`、沒命中 prompt cache：
+
+| | decode | prefill |
+|---|---|---|
+| 8K token 的 prompt | 46 | 528 |
+| 32K token 的 prompt | 45 | 544 |
+| 16K token 的程式碼 prompt | 42 | — |
+| 短 prompt（程式碼／散文／開 thinking） | 43／35／36 | — |
+| 262K 灌滿（最後三個 commit 之前量的） | 30–31 | 約 480 |
+
+- 對上一版檔案（只有 `IQ2down`）：長 context decode +10–13%（8K 41.0 → 46.1、32K 40.7 → 44.8、16K 程式碼 37.4 → 42.2），
+  prefill 不變。那一輪短 prompt 雜訊太大，不引用。
+- 上面那些記憶體補丁都不影響速度（輸出逐字相同、decode 差在 ±0.5% 內）。`--prefill-chunk` 用 1024 而不是 2048，
+  是拿約 10% 的 prefill 速度換約 1 GiB 記憶體。
+- agentic（Claude Code，3 題各 3 次）：每一步都 9/9；最終檔對 `IQ2down` 牆鐘 −5%。
 - 這台機器上 ds4 decode 卡在記憶體頻寬：藏 SSD 延遲、提高 MTP 接受率都沒效果，只有每個 token 少讀位元組才會變快。
+
+### 品質
+
+| | 官方 Q2 | `IQ2down` | 最終檔 |
+|---|---|---|---|
+| agentic（3 題各 3 次） | 9/9 | 9/9 | 9/9 |
+| HumanEval+ base／plus（164 題，greedy，thinking 關） | 156／152 | 154／149 | 156／151 |
+| BFCL simple_python＋multiple（600 題，greedy，thinking 關） | 522 | 492 | 516 |
+| 繁中回答裡的簡體字比例 | 0.42% | 0.40% | 與 `IQ2down` 差在雜訊內 |
+
+會掉品質的是 `IQ2down` 那一步（thinking 關時 BFCL −30、顯著；thinking 開時 556 對 567、不顯著）。
+這些 benchmark 不涵蓋真實的長 session。
