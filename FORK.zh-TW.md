@@ -93,7 +93,7 @@ python3 gguf-tools/qwen4_hc_q8.py     --model $M/Qwen3.8-Flash-Next-Q2-downiq2-d
 | 35da5e9 down experts 去列尾 padding | 43.7 | 51.6 |
 | 737717f＋5fe6907 indexer 環狀緩衝區 | 43.5 | 50.2 |
 | 0a3d8ef down experts 改 IQ2_XXS（`IQ2down`） | 40.7 | 47.2 |
-| 5d7c601–07e6470＋最終檔（`Q4Kdense`、`Q8hc`） | 約 38 | 沒量 |
+| 5d7c601–07e6470＋最終檔（`Q4Kdense`、`Q8hc`） | 約 38 | 44.1（扣掉閒置基線 2.65 後 41.4；上一列扣掉 3.77 後 43.4） |
 
 - 閒置（模型已載入、沒有請求）：`DS4_METAL_NO_RESIDENCY=1` 讓 wired 從 42.2 降到 4.0 GiB。
 - context：用 `--prefill-chunk 1024` 的話，上游在這台機器上也塞得下 262K（swap 0–35 MB）；
@@ -109,8 +109,9 @@ python3 gguf-tools/qwen4_hc_q8.py     --model $M/Qwen3.8-Flash-Next-Q2-downiq2-d
 | 32K token 的 prompt | 45 | 544 |
 | 16K token 的程式碼 prompt | 42 | — |
 | 短 prompt（程式碼／散文／開 thinking） | 43／35／36 | — |
-| 262K 灌滿（最後三個 commit 之前量的） | 30–31 | 約 480 |
+| 262K 灌滿（260K token 的 prompt） | 35 | 545（整段平均） |
 
+- 灌滿那一列是 2026-10-20 另一場次量的（`IQ2down` 在同條件是 prefill 469、decode 約 28，跨場次，不算乾淨的對照）。
 - 對上一版檔案（只有 `IQ2down`）：長 context decode +10–13%（8K 41.0 → 46.1、32K 40.7 → 44.8、16K 程式碼 37.4 → 42.2），
   prefill 不變。那一輪短 prompt 雜訊太大，不引用。
 - 上面那些記憶體補丁都不影響速度（輸出逐字相同、decode 差在 ±0.5% 內）。`--prefill-chunk` 用 1024 而不是 2048，

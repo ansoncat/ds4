@@ -96,7 +96,7 @@ Every step was measured against the step before it in the same session (the spee
 | 35da5e9 down experts without row padding | 43.7 | 51.6 |
 | 737717f + 5fe6907 indexer ring buffer | 43.5 | 50.2 |
 | 0a3d8ef down experts as IQ2_XXS (`IQ2down`) | 40.7 | 47.2 |
-| 5d7c601–07e6470 + final file (`Q4Kdense`, `Q8hc`) | about 38 | not measured |
+| 5d7c601–07e6470 + final file (`Q4Kdense`, `Q8hc`) | about 38 | 44.1 (41.4 above an idle baseline of 2.65; the row above is 43.4 above 3.77) |
 
 - Idle (model loaded, no request): 42.2 → 4.0 GiB with `DS4_METAL_NO_RESIDENCY=1`.
 - Context: with `--prefill-chunk 1024`, upstream also fits a full 262K context on this machine (0–35 MB of swap);
@@ -112,8 +112,9 @@ Final setup, single user, `--mtp`, prompt cache not hit:
 | 32K-token prompt | 45 | 544 |
 | 16K-token code prompt | 42 | — |
 | Short prompts (code / prose / with thinking) | 43 / 35 / 36 | — |
-| Full 262K context (measured before the last three commits) | 30–31 | about 480 |
+| Full 262K context (260K-token prompt) | 35 | 545 (average over the whole prompt) |
 
+- The full-context row was measured on 2026-10-20 in a different session from the rest (`IQ2down` in that setting: 469 prefill, about 28 decode, cross-session, so not a clean comparison).
 - Changes against the previous file (`IQ2down` only): long-context decode +10–13% (8K 41.0 → 46.1, 32K 40.7 → 44.8,
   16K code 37.4 → 42.2), prefill unchanged. Short prompts are too noisy in that round to quote.
 - The memory patches above leave speed unchanged (outputs identical, decode within ±0.5%). `--prefill-chunk 1024`
