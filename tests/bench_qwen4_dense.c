@@ -5,7 +5,8 @@
  * weights resident, so the gap between bytes saved and time saved can be read per shape.  Weights are random but
  * well formed (finite fp16 scales); timing does not depend on the values.
  *
- *   make tests/bench_qwen4_dense && ./tests/bench_qwen4_dense
+ *   make ds4_metal.o ds4_image.o && cc -O2 -Wall -o tests/bench_qwen4_dense tests/bench_qwen4_dense.c ds4_metal.o ds4_image.o \
+ *     -lm -lpthread -framework Foundation -framework Metal && ./tests/bench_qwen4_dense
  */
 #include <math.h>
 #include <stdint.h>
