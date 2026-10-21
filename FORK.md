@@ -30,8 +30,9 @@ and the Metal backend only and have not been sent upstream. Measurements and dec
 | 26968d9 | Q4_K matvec for 2–4 tokens (MTP verify reads the weights once); `gguf-tools/qwen4_hc_q8.py` (per-layer hyper-connection low-rank tensors F16 → Q8_0); `tests/bench_qwen4_dense.c` |
 | 07e6470 | `DS4_QWEN4_HC_Q8_GEMM=1` routes Q8_0 `hc_*_up` tensors through the prefill GEMM path as well |
 | c3b08cb | IQ2_XXS routed expert decode kernels (`kernel_qwen4_moe_{mid,down}_iq2_*`): one activation read shared by gate/up and several rows, down-row reads issued up front. Bit-identical to the generic rows; decode +8–16%. Default on M5, `DS4_QWEN4_MOE_IQ2=0` turns it off; `tests/bench_qwen4_moe.c` |
+| 901e0f7 | Indexer scores and top-k selection in slices of the rows a 64 MiB scratch holds (`DS4_QWEN4_IDX_SCORE_MB`); the scratch was a full row of blocks per chunk token (0.5 GiB at 262K with a 2048 chunk). Byte-identical outputs, prefill unchanged; full-context peak −0.63 GiB |
 
-## Current setup (file since 2026-10-19, expert kernels since 2026-10-21)
+## Current setup (file since 2026-10-19, expert kernels, indexer slices and `--prefill-chunk 2048` since 2026-10-21)
 
 The converted file is on Hugging Face:
 [ansoncat/qwen3.8-flash-next-ds4-64gb-mac-gguf](https://huggingface.co/ansoncat/qwen3.8-flash-next-ds4-64gb-mac-gguf)
@@ -102,6 +103,8 @@ Every step was measured against the step before it in the same session (the spee
 - Idle (model loaded, no request): 42.2 → 4.0 GiB with `DS4_METAL_NO_RESIDENCY=1`.
 - `--prefill-chunk 2048` (the command above, since 2026-10-21) adds 0.6–1.0 GiB at the prefill peak, more at longer contexts:
   7K-token prompt 37.6 → 38.2, 30K 38.1 → 38.8, 62K 38.9 → 39.7, 127K 40.7 → 41.6, full 262K 44.3 → 45.2 GiB (1024 → 2048).
+  901e0f7 (indexer scores in slices) takes 2048 back down at long contexts: 127K 41.56 → 41.35, full 262K 45.24 → 44.61 GiB;
+  unchanged up to 64K. Outputs byte-identical, prefill unchanged.
 - Context: with `--prefill-chunk 1024`, upstream also fits a full 262K context on this machine (0–35 MB of swap);
   this branch leaves about 8 GiB more headroom at full context and much more in normal-length conversations.
 
