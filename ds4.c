@@ -39654,6 +39654,25 @@ static ds4_context_memory glm_graph_context_memory_estimate_for_compact_cap(
 #ifdef DS4_HAS_DEEPSEEK41_GPU
 static ds4_context_memory ds41_graph_memory(uint32_t ctx);
 #endif
+/* Rows of indexer scores the scratch holds at a width of `blocks`: at most
+ * DS4_QWEN4_IDX_SCORE_MB (64) of them, never fewer than a batched decode's 64
+ * rows or more than the chunk.  The attention layer scores and selects a
+ * chunk in slices of this many rows; below the cap (about 32K tokens of
+ * context at a 2048 chunk) that is one slice, as before.  Slices start on a
+ * multiple of 16 rows, the scorer's token tile. */
+static uint64_t qwen4_score_rows(uint64_t T, uint64_t blocks) {
+    static uint64_t budget;
+    if (!budget) {
+        const char *env = getenv("DS4_QWEN4_IDX_SCORE_MB");
+        const unsigned long mb = env && env[0] ? strtoul(env, NULL, 10) : 64ul;
+        budget = (uint64_t)(mb ? mb : 64ul) << 20;
+    }
+    uint64_t rows = budget / (blocks * sizeof(float));
+    if (rows >= T) return T;
+    rows &= ~(uint64_t)15u;
+    return rows < 64u ? (T < 64u ? T : 64u) : rows;   /* 64: QWEN4_BATCH_MAX_ROWS */
+}
+
 static uint32_t qwen4_prefill_chunk_tokens(uint32_t ctx) {
     const char *env = getenv("DS4_QWEN4_PREFILL_CHUNK");
     const unsigned long v = env && env[0] ? strtoul(env, NULL, 10) : 8192ul;
@@ -39686,8 +39705,8 @@ ds4_context_memory ds4_context_memory_estimate_with_prefill_mode(
         m.comp_cap = (uint32_t)blocks;
         m.raw_bytes = (uint64_t)n_attn * ctx * kv_row + (uint64_t)ctx * 16u;
         m.compressed_bytes = ik_rows * DS4_N_INDEXER_HEAD_DIM * 4u + (uint64_t)n_attn * blocks * DS4_N_INDEXER_HEAD_DIM * 2u;
-        m.scratch_bytes = T * (12u * hc_dim + 24u * E + (uint64_t)(DS4_N_EXPERT_USED + 1u) * (E + 2u * DS4_N_FF_EXP) +
-                               2u * blocks) * 4u;
+        m.scratch_bytes = T * (12u * hc_dim + 24u * E + (uint64_t)(DS4_N_EXPERT_USED + 1u) * (E + 2u * DS4_N_FF_EXP)) * 4u +
+                          qwen4_score_rows(T, blocks) * 2u * blocks * 4u;
         /* Recurrent layers have fixed state even at a tiny context. Reserve
          * both MTP snapshots as well as live state for conservative admission. */
         m.scratch_bytes += 3ull * (DS4_N_LAYER - n_attn) *
@@ -57943,16 +57962,17 @@ static bool qwen4_kv_swap(ds4_gpu_tensor **slot, ds4_gpu_tensor *fresh) {
     return true;
 }
 
-/* The indexer scores hold a row of blocks per chunk token: 0.25 GiB at
- * 262144 tokens and a 1024 chunk, wired like the caches.  A session whose
- * transients are its own for good sizes them for the blocks its caches hold. */
+/* The indexer scores hold a row of blocks per scored token, wired like the
+ * caches: 0.5 GiB at 262144 tokens for a whole 2048 chunk, so they hold
+ * qwen4_score_rows of them.  A session whose transients are its own for good
+ * sizes them for the blocks its caches hold. */
 static bool qwen4_graph_score_fit(ds4_qwen4_gpu_graph *g) {
     if (!g->score_grows) return true;
-    const uint64_t T = g->cap_tokens, blocks = g->kv_cap / 4u + 1u;
+    const uint64_t blocks = g->kv_cap / 4u + 1u, rows = qwen4_score_rows(g->cap_tokens, blocks);
     ds4_gpu_tensor_free(g->score);
     ds4_gpu_tensor_free(g->tile_max);
-    g->score = qwen4_graph_alloc_f32(T * blocks);
-    g->tile_max = qwen4_graph_alloc_f32(T * (blocks / 8u + 1u));
+    g->score = qwen4_graph_alloc_f32(rows * blocks);
+    g->tile_max = qwen4_graph_alloc_f32(rows * (blocks / 8u + 1u));
     return g->score && g->tile_max;
 }
 
@@ -58069,8 +58089,8 @@ static bool qwen4_graph_alloc(ds4_qwen4_gpu_graph *g, const ds4_weights *w, uint
     QWEN4_ALLOC(gate, T * q_dim);
     QWEN4_ALLOC(iqn, T * iq_dim);
     QWEN4_ALLOC(attn_o, T * q_dim);
-    QWEN4_ALLOC(score, T * g->n_block_cap);
-    QWEN4_ALLOC(tile_max, T * (g->n_block_cap / 8u + 1u));
+    QWEN4_ALLOC(score, qwen4_score_rows(T, g->n_block_cap) * g->n_block_cap);
+    QWEN4_ALLOC(tile_max, qwen4_score_rows(T, g->n_block_cap) * (g->n_block_cap / 8u + 1u));
     QWEN4_ALLOC(sel_blocks, T * g->k_blocks);
     QWEN4_ALLOC(sel_tokens, T * g->sel_stride);
     QWEN4_ALLOC(n_sel, T);
@@ -58550,12 +58570,33 @@ static bool qwen4_graph_attention_core(ds4_qwen4_gpu_graph *g, uint32_t il,
     ds4_gpu_tensor *iqn = ds4_gpu_tensor_view(iqn_rows,
             (uint64_t)n_dense * DS4_N_INDEXER_HEAD * DS4_N_INDEXER_HEAD_DIM * sizeof(float),
             (uint64_t)n_sparse * DS4_N_INDEXER_HEAD * DS4_N_INDEXER_HEAD_DIM * sizeof(float));
-    const bool ok = q && gate && o && iqn &&
-        ds4_gpu_qwen4_idx_score_tensor(g->score, n_sparse <= 2u ? g->tile_max : NULL, iqn,
-                                       g->layer_block_key[il], n_sparse, n_blocks_after,
-                                       DS4_N_INDEXER_HEAD, DS4_N_INDEXER_HEAD_DIM, sp0, ratio) &&
-        qwen4_idx_select(g->sel_blocks, g->score, n_sparse <= 2u ? g->tile_max : NULL,
-                         n_blocks_after, n_sparse, g->k_blocks) &&
+    bool ok = q && gate && o && iqn;
+    /* Score and select in slices of the rows the scratch holds; every row's
+     * scores depend only on its own query and position.  A slice of more
+     * than two rows never leaves one or two behind: those would take the
+     * decode scorer. */
+    const uint64_t slice = ds4_gpu_tensor_bytes(g->score) / sizeof(float) / n_blocks_after;
+    const uint64_t iq_row = (uint64_t)DS4_N_INDEXER_HEAD * DS4_N_INDEXER_HEAD_DIM * sizeof(float);
+    for (uint32_t r0 = 0, n; ok && r0 < n_sparse; r0 += n) {
+        n = n_sparse - r0;
+        if (n > slice) {
+            n = (uint32_t)(slice & ~(uint64_t)15u);
+            if (n_sparse - r0 - n <= 2u) n -= 16u;
+        }
+        ds4_gpu_tensor *iqs = n == n_sparse ? iqn : ds4_gpu_tensor_view(iqn, r0 * iq_row, n * iq_row);
+        ds4_gpu_tensor *sel = n == n_sparse ? g->sel_blocks :
+            ds4_gpu_tensor_view(g->sel_blocks, (uint64_t)r0 * g->k_blocks * sizeof(int32_t),
+                                (uint64_t)n * g->k_blocks * sizeof(int32_t));
+        ok = iqs && sel &&
+            ds4_gpu_qwen4_idx_score_tensor(g->score, n_sparse <= 2u ? g->tile_max : NULL, iqs,
+                                           g->layer_block_key[il], n, n_blocks_after,
+                                           DS4_N_INDEXER_HEAD, DS4_N_INDEXER_HEAD_DIM, sp0 + r0, ratio) &&
+            qwen4_idx_select(sel, g->score, n_sparse <= 2u ? g->tile_max : NULL,
+                             n_blocks_after, n, g->k_blocks);
+        if (iqs != iqn) ds4_gpu_tensor_free(iqs);
+        if (sel != g->sel_blocks) ds4_gpu_tensor_free(sel);
+    }
+    ok = ok &&
         ds4_gpu_qwen4_idx_expand_tensor(g->sel_tokens, g->n_sel, g->sel_blocks, n_sparse, g->k_blocks, ratio,
                                         sp0, g->sel_stride) &&
         ds4_gpu_qwen4_attn_decode_tensor(o, q, gate, g->layer_k_cache[il], g->layer_v_cache[il],
