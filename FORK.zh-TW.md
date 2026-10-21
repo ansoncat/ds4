@@ -44,13 +44,13 @@ make ds4-server
 M=~/models/ds4-gguf
 DS4_METAL_NO_RESIDENCY=1 DS4_QWEN4_HC_Q8_GEMM=1 ./ds4-server \
   -m $M/Qwen3.8-Flash-Next-Q2-IQ2down-Q4Kdense-Q8hc.gguf --vision $M/mmproj-Qwen3.8-Flash-Next-Q8_0.gguf \
-  --ctx 262144 --prefill-chunk 1024 --mtp \
+  --ctx 262144 --prefill-chunk 2048 --mtp \
   --kv-disk-dir ~/.ds4/server-kv/Q2-IQ2down-Q4Kdense-Q8hc --kv-disk-space-mb 102400
 ```
 - `DS4_QWEN4_HC_Q8_GEMM=1` **必帶**：hc 是 Q8_0 的檔沒有它，prefill 會掉 62%。
 - `DS4_METAL_NO_RESIDENCY=1`：閒置時不釘住模型（wired 42 → 4 GiB），速度不變。
 - `--vision` 可省略；投影檔來自 [ggml-org/Qwen3.8-Flash-Next-GGUF](https://huggingface.co/ggml-org/Qwen3.8-Flash-Next-GGUF)。
-- 這台機器用 `sudo sysctl iogpu.wired_limit_mb=57344` 調高了 GPU wired 記憶體上限（運算中約 41 GiB、262K 灌滿約 47 GiB）。
+- 這台機器用 `sudo sysctl iogpu.wired_limit_mb=57344` 調高了 GPU wired 記憶體上限（短對話約 38 GiB、262K 灌滿約 45 GiB）。
   64 GB 機器用 macOS 預設值時，長 context 可能配置失敗；把 `--ctx` 調小或調高上限。
 - 每個模型檔用自己的 `--kv-disk-dir` 子目錄：checkpoint 只記 model id 與 routed experts 的量化位元數
   （官方 Q2 與所有衍生檔都是 2），分不出不同的轉檔版本。
@@ -97,6 +97,8 @@ python3 gguf-tools/qwen4_hc_q8.py     --model $M/Qwen3.8-Flash-Next-Q2-downiq2-d
 | 5d7c601–07e6470＋最終檔（`Q4Kdense`、`Q8hc`） | 約 38 | 44.1（扣掉閒置基線 2.65 後 41.4；上一列扣掉 3.77 後 43.4） |
 
 - 閒置（模型已載入、沒有請求）：`DS4_METAL_NO_RESIDENCY=1` 讓 wired 從 42.2 降到 4.0 GiB。
+- `--prefill-chunk 2048`（上面的指令，2026-10-21 起）讓 prefill 峰值多 0.6–1.0 GiB，context 越長越多：
+  7K token 的 prompt 37.6 → 38.2、30K 38.1 → 38.8、62K 38.9 → 39.7、127K 40.7 → 41.6、262K 灌滿 44.3 → 45.2 GiB（1024 → 2048）。
 - context：用 `--prefill-chunk 1024` 的話，上游在這台機器上也塞得下 262K（swap 0–35 MB）；
   這個分支在灌滿時多留約 8 GiB 餘裕，一般長度的對話餘裕更多。
 
@@ -118,8 +120,9 @@ python3 gguf-tools/qwen4_hc_q8.py     --model $M/Qwen3.8-Flash-Next-Q2-downiq2-d
 - 灌滿那一列是 2026-10-20 另一場次量的（`IQ2down` 在同條件是 prefill 469、decode 約 28，跨場次，不算乾淨的對照）。
 - 對上一版檔案（只有 `IQ2down`）：長 context decode +10–13%（8K 41.0 → 46.1、32K 40.7 → 44.8、16K 程式碼 37.4 → 42.2），
   prefill 不變。那一輪短 prompt 雜訊太大，不引用。
-- 上面那些記憶體補丁都不影響速度（輸出逐字相同、decode 差在 ±0.5% 內）。`--prefill-chunk` 用 1024 而不是 2048，
-  是拿約 10% 的 prefill 速度換約 1 GiB 記憶體。
+- 上面那些記憶體補丁都不影響速度（輸出逐字相同、decode 差在 ±0.5% 內）。
+- prefill 那欄是 `--prefill-chunk 1024` 量的。2048 快 7–12%（2026-10-21，同一個 binary，各 4 次取中位數，另一場次）：
+  8K 624 → 670、32K 538 → 593、128K 518 → 569、254K 499 → 557（首字等待 510 → 457 秒）。
 - agentic（Claude Code，3 題各 3 次）：每一步都 9/9；最終檔對 `IQ2down` 牆鐘 −5%。
 - 這台機器上 decode 時 GPU 約 96% 時間在忙，所以藏 SSD 延遲、提高 MTP 接受率都沒效果。c3b08cb 之前兩顆 IQ2_XXS
   expert kernel 佔每步約 40%、頻寬只有 53–77 GB/s（dense Q4_K 約 250）；這次的加速來自把它們寫有效率，不是少讀位元組。

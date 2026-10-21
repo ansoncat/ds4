@@ -44,14 +44,14 @@ make ds4-server
 M=~/models/ds4-gguf
 DS4_METAL_NO_RESIDENCY=1 DS4_QWEN4_HC_Q8_GEMM=1 ./ds4-server \
   -m $M/Qwen3.8-Flash-Next-Q2-IQ2down-Q4Kdense-Q8hc.gguf --vision $M/mmproj-Qwen3.8-Flash-Next-Q8_0.gguf \
-  --ctx 262144 --prefill-chunk 1024 --mtp \
+  --ctx 262144 --prefill-chunk 2048 --mtp \
   --kv-disk-dir ~/.ds4/server-kv/Q2-IQ2down-Q4Kdense-Q8hc --kv-disk-space-mb 102400
 ```
 - `DS4_QWEN4_HC_Q8_GEMM=1` is **required**: with Q8_0 hc tensors and without it, prefill drops by 62%.
 - `DS4_METAL_NO_RESIDENCY=1`: the model is not pinned while idle (wired memory 42 → 4 GiB), with no speed cost.
 - `--vision` is optional; the projector comes from [ggml-org/Qwen3.8-Flash-Next-GGUF](https://huggingface.co/ggml-org/Qwen3.8-Flash-Next-GGUF).
 - This machine raises the GPU wired-memory limit with `sudo sysctl iogpu.wired_limit_mb=57344`
-  (about 41 GiB in use while computing, 47 GiB with a full 262K context). With the macOS default on 64 GB,
+  (about 38 GiB in use for a short conversation, 45 GiB with a full 262K context). With the macOS default on 64 GB,
   long contexts may fail to allocate; use a smaller `--ctx` or raise the limit.
 - Give each model file its own `--kv-disk-dir` subdirectory: a checkpoint records only the model id and the routed
   experts' quantization bits (2 for the official Q2 and every file derived from it), so it cannot tell conversions apart.
@@ -100,6 +100,8 @@ Every step was measured against the step before it in the same session (the spee
 | 5d7c601–07e6470 + final file (`Q4Kdense`, `Q8hc`) | about 38 | 44.1 (41.4 above an idle baseline of 2.65; the row above is 43.4 above 3.77) |
 
 - Idle (model loaded, no request): 42.2 → 4.0 GiB with `DS4_METAL_NO_RESIDENCY=1`.
+- `--prefill-chunk 2048` (the command above, since 2026-10-21) adds 0.6–1.0 GiB at the prefill peak, more at longer contexts:
+  7K-token prompt 37.6 → 38.2, 30K 38.1 → 38.8, 62K 38.9 → 39.7, 127K 40.7 → 41.6, full 262K 44.3 → 45.2 GiB (1024 → 2048).
 - Context: with `--prefill-chunk 1024`, upstream also fits a full 262K context on this machine (0–35 MB of swap);
   this branch leaves about 8 GiB more headroom at full context and much more in normal-length conversations.
 
@@ -121,8 +123,9 @@ Final setup, single user, `--mtp`, prompt cache not hit:
 - The full-context row was measured on 2026-10-20 in a different session from the rest (`IQ2down` in that setting: 469 prefill, about 28 decode, cross-session, so not a clean comparison).
 - Changes against the previous file (`IQ2down` only): long-context decode +10–13% (8K 41.0 → 46.1, 32K 40.7 → 44.8,
   16K code 37.4 → 42.2), prefill unchanged. Short prompts are too noisy in that round to quote.
-- The memory patches above leave speed unchanged (outputs identical, decode within ±0.5%). `--prefill-chunk 1024`
-  instead of 2048 trades about 10% of prefill speed for about 1 GiB of memory.
+- The memory patches above leave speed unchanged (outputs identical, decode within ±0.5%).
+- The prefill column is at `--prefill-chunk 1024`. 2048 is 7–12% faster (2026-10-21, same binary, medians of 4 runs
+  each, a separate session): 8K 624 → 670, 32K 538 → 593, 128K 518 → 569, 254K 499 → 557 (time to first token 510 → 457 s).
 - Agentic coding (Claude Code, 3 fixtures × 3 runs): 9/9 in every step; wall time −5% for the final file against `IQ2down`.
 - On this machine the GPU is busy ~96% of a decode step, so hiding SSD latency or raising MTP acceptance does nothing.
   Before c3b08cb the two IQ2_XXS expert kernels took ~40% of a step at only 53–77 GB/s (dense Q4_K runs at ~250);
