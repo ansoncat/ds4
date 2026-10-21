@@ -39673,6 +39673,31 @@ static uint64_t qwen4_score_rows(uint64_t T, uint64_t blocks) {
     return rows < 64u ? (T < 64u ? T : 64u) : rows;   /* 64: QWEN4_BATCH_MAX_ROWS */
 }
 
+/* Floats per chunk row of the transients that persist through a layer
+ * (R, the hc mixer's buffers and its inject, mixed, blk, the n-gram rows) and
+ * of the largest stage sharing the region after them (qwen4_graph_alloc). */
+static uint64_t qwen4_kept_row_floats(void) {
+    const uint64_t E = DS4_N_EMBD, hc_dim = E * DS4_N_HC;
+    return 3u * hc_dim + 2u * DS4_N_HC_LOWRANK + 2u * DS4_N_HC * DS4_QWEN4_HC_CHUNKS * DS4_N_HC + 3u * E;
+}
+
+static uint64_t qwen4_stage_row_floats(void) {
+    const uint64_t E = DS4_N_EMBD, hc_dim = E * DS4_N_HC, q = (uint64_t)DS4_N_HEAD * DS4_N_HEAD_DIM;
+    const uint64_t kv = (uint64_t)DS4_N_HEAD_KV * DS4_N_HEAD_DIM;
+    const uint64_t iq = (uint64_t)DS4_N_INDEXER_HEAD * DS4_N_INDEXER_HEAD_DIM;
+    const uint64_t v = (uint64_t)DS4_N_LIN_V_HEAD * DS4_N_LIN_HEAD_DIM, kb = DS4_N_INDEXER_TOP_K / 4u;
+    const uint64_t s[4] = {
+        3u * hc_dim + E,
+        DS4_N_LIN_CONV_DIM + 2u * v + 2u * DS4_N_LIN_V_HEAD,
+        5u * q + 2u * kv + 2u * iq + DS4_N_INDEXER_HEAD_DIM + kb + (kb * 4u + 4u) + 1u,
+        2u * DS4_N_EXPERT + 2u * DS4_N_EXPERT_USED + 1u + (uint64_t)(DS4_N_EXPERT_USED + 1u) * (E + DS4_N_FF_EXP) +
+            3u * DS4_N_FF_EXP + E,
+    };
+    uint64_t m = 0;
+    for (int i = 0; i < 4; i++) if (s[i] > m) m = s[i];
+    return m;
+}
+
 static uint32_t qwen4_prefill_chunk_tokens(uint32_t ctx) {
     const char *env = getenv("DS4_QWEN4_PREFILL_CHUNK");
     const unsigned long v = env && env[0] ? strtoul(env, NULL, 10) : 8192ul;
@@ -39691,7 +39716,7 @@ ds4_context_memory ds4_context_memory_estimate_with_prefill_mode(
         /* per-token f16 K/V and raw indexer keys per attention layer, pooled
          * block keys, rope positions; transients scale with the prefill chunk */
         const uint64_t T = prefill_chunk ? prefill_chunk : qwen4_prefill_chunk_tokens(ctx);
-        const uint64_t blocks = ctx / 4u + 1u, E = DS4_N_EMBD, hc_dim = E * DS4_N_HC;
+        const uint64_t blocks = ctx / 4u + 1u;
         const uint64_t kv_row = 2ull * DS4_N_HEAD_KV * DS4_N_HEAD_DIM * 2u;
         uint32_t n_attn = 0;
         uint64_t ik_rows = 0;
@@ -39705,7 +39730,7 @@ ds4_context_memory ds4_context_memory_estimate_with_prefill_mode(
         m.comp_cap = (uint32_t)blocks;
         m.raw_bytes = (uint64_t)n_attn * ctx * kv_row + (uint64_t)ctx * 16u;
         m.compressed_bytes = ik_rows * DS4_N_INDEXER_HEAD_DIM * 4u + (uint64_t)n_attn * blocks * DS4_N_INDEXER_HEAD_DIM * 2u;
-        m.scratch_bytes = T * (12u * hc_dim + 24u * E + (uint64_t)(DS4_N_EXPERT_USED + 1u) * (E + 2u * DS4_N_FF_EXP)) * 4u +
+        m.scratch_bytes = T * (qwen4_kept_row_floats() + qwen4_stage_row_floats()) * 4u +
                           qwen4_score_rows(T, blocks) * 2u * blocks * 4u;
         /* Recurrent layers have fixed state even at a tiny context. Reserve
          * both MTP snapshots as well as live state for conservative admission. */
@@ -57616,7 +57641,15 @@ static const ds4_vision_span *qwen4_fake_spans(size_t *count) {
     X(score) X(tile_max) X(sel_blocks) X(sel_tokens) X(n_sel) X(attn_part) \
     X(router) X(selected) X(weights) X(mid) X(part) X(sh_gate_logit) \
     X(moe_lists) X(moe_counts) X(sh_gate) X(sh_up) X(sh_mid) X(sh_out) \
-    X(hc_u) X(hc_lo_act)
+    X(hc_u) X(hc_lo_act) X(stage)
+
+/* The scratch fields above that are views into `stage` (qwen4_graph_alloc). */
+#define DS4_QWEN4_STAGE_FIELDS(X) \
+    X(ple_key) X(ple_val) X(ple_gated) X(ple_normed) \
+    X(qkv) X(z) X(ga) X(gb) X(lin_o) \
+    X(qg) X(kp) X(vp) X(iq) X(ik) X(q) X(gate) X(iqn) X(attn_o) X(sel_blocks) X(sel_tokens) X(n_sel) \
+    X(part) X(mid) X(router) X(selected) X(weights) X(sh_gate_logit) X(moe_lists) X(moe_counts) \
+    X(sh_gate) X(sh_up) X(sh_mid) X(sh_out)
 
 typedef struct ds4_qwen4_gpu_graph {
     uint32_t ctx_cap;
@@ -57637,6 +57670,7 @@ typedef struct ds4_qwen4_gpu_graph {
     ds4_gpu_tensor *score, *tile_max, *sel_blocks, *sel_tokens, *n_sel, *attn_part;
     ds4_gpu_tensor *router, *selected, *weights, *mid, *part, *sh_gate_logit;
     ds4_gpu_tensor *moe_lists, *moe_counts, *sh_gate, *sh_up, *sh_mid, *sh_out, *hc_u, *hc_lo_act;
+    ds4_gpu_tensor *stage;   /* the region the DS4_QWEN4_STAGE_FIELDS views share */
     ds4_gpu_tensor *logits;
     /* Arena only, grown on demand: one logit row per batch member, the
      * attention rows' cache table (one entry per row and layer) and their
@@ -57917,7 +57951,10 @@ static void qwen4_graph_transfer_scratch(ds4_qwen4_gpu_graph *dst, ds4_qwen4_gpu
 static uint64_t qwen4_graph_scratch_bytes(const ds4_qwen4_gpu_graph *g) {
     uint64_t total = 0;
 #define QWEN4_COUNT(field_) total += ds4_gpu_tensor_bytes(g->field_);
+#define QWEN4_UNCOUNT(field_) total -= ds4_gpu_tensor_bytes(g->field_);
     DS4_QWEN4_SCRATCH_FIELDS(QWEN4_COUNT)
+    DS4_QWEN4_STAGE_FIELDS(QWEN4_UNCOUNT)   /* counted once, as `stage` */
+#undef QWEN4_UNCOUNT
 #undef QWEN4_COUNT
     return total;
 }
@@ -58069,45 +58106,53 @@ static bool qwen4_graph_alloc(ds4_qwen4_gpu_graph *g, const ds4_weights *w, uint
     QWEN4_ALLOC(inj_alt, T * hc * DS4_QWEN4_HC_CHUNKS * hc);
     QWEN4_ALLOC(mixed, T * E);
     QWEN4_ALLOC(blk, T * E);
-    QWEN4_ALLOC(qkv, T * conv_dim);
-    QWEN4_ALLOC(z, T * v_dim);
-    QWEN4_ALLOC(ga, T * DS4_N_LIN_V_HEAD);
-    QWEN4_ALLOC(gb, T * DS4_N_LIN_V_HEAD);
-    QWEN4_ALLOC(lin_o, T * v_dim);
     QWEN4_ALLOC(ple_emb, T * E);
-    QWEN4_ALLOC(ple_key, T * hc_dim);
-    QWEN4_ALLOC(ple_val, T * E);
-    QWEN4_ALLOC(ple_gated, T * hc_dim);
-    QWEN4_ALLOC(ple_normed, T * hc_dim);
-    QWEN4_ALLOC(qg, T * 2u * q_dim);
-    QWEN4_ALLOC(kp, T * kv_dim);
-    QWEN4_ALLOC(vp, T * kv_dim);
-    QWEN4_ALLOC(iq, T * iq_dim);
-    QWEN4_ALLOC(ik, T * DS4_N_INDEXER_HEAD_DIM);
     QWEN4_ALLOC(attn_part, ds4_gpu_qwen4_attn_part_floats(3u, DS4_N_HEAD, DS4_N_HEAD_DIM));
-    QWEN4_ALLOC(q, T * q_dim);
-    QWEN4_ALLOC(gate, T * q_dim);
-    QWEN4_ALLOC(iqn, T * iq_dim);
-    QWEN4_ALLOC(attn_o, T * q_dim);
     QWEN4_ALLOC(score, qwen4_score_rows(T, g->n_block_cap) * g->n_block_cap);
     QWEN4_ALLOC(tile_max, qwen4_score_rows(T, g->n_block_cap) * (g->n_block_cap / 8u + 1u));
-    QWEN4_ALLOC(sel_blocks, T * g->k_blocks);
-    QWEN4_ALLOC(sel_tokens, T * g->sel_stride);
-    QWEN4_ALLOC(n_sel, T);
-    QWEN4_ALLOC(router, T * DS4_N_EXPERT);
-    QWEN4_ALLOC(selected, T * DS4_N_EXPERT_USED);
-    QWEN4_ALLOC(weights, T * DS4_N_EXPERT_USED);
-    QWEN4_ALLOC(mid, T * (DS4_N_EXPERT_USED + 1u) * DS4_N_FF_EXP);
-    QWEN4_ALLOC(part, T * (DS4_N_EXPERT_USED + 1u) * E);
-    QWEN4_ALLOC(sh_gate_logit, T);
-    QWEN4_ALLOC(moe_lists, (uint64_t)DS4_N_EXPERT * T);
-    QWEN4_ALLOC(moe_counts, DS4_N_EXPERT);
-    QWEN4_ALLOC(sh_gate, T * DS4_N_FF_EXP);
-    QWEN4_ALLOC(sh_up, T * DS4_N_FF_EXP);
-    QWEN4_ALLOC(sh_mid, T * DS4_N_FF_EXP);
-    QWEN4_ALLOC(sh_out, T * E);
     QWEN4_ALLOC(hc_u, T * hc_dim);
     QWEN4_ALLOC(hc_lo_act, T * DS4_N_HC_LOWRANK);
+    {
+        /* Buffers that live inside one stage of a layer share one region,
+         * sized for the largest stage: the PLE gate, a GDN layer, an
+         * attention layer, the MoE.  A stage takes its input from and leaves
+         * its output in the buffers above (R, inj, mixed, blk), and the
+         * commands run in order, so no stage reads what another wrote here.
+         * The hc mixer's xn/lo/hc_lo_act stay out: the batched MTP head
+         * mixes a residual it staged in part.  Each view keeps the size the
+         * buffer had on its own. */
+        struct { ds4_gpu_tensor **t; uint64_t n; uint32_t stage; uint64_t off; } v[] = {
+            { &g->ple_key, T * hc_dim, 0, 0 }, { &g->ple_val, T * E, 0, 0 },
+            { &g->ple_gated, T * hc_dim, 0, 0 }, { &g->ple_normed, T * hc_dim, 0, 0 },
+            { &g->qkv, T * conv_dim, 1, 0 }, { &g->z, T * v_dim, 1, 0 },
+            { &g->ga, T * DS4_N_LIN_V_HEAD, 1, 0 }, { &g->gb, T * DS4_N_LIN_V_HEAD, 1, 0 },
+            { &g->lin_o, T * v_dim, 1, 0 },
+            { &g->qg, T * 2u * q_dim, 2, 0 }, { &g->kp, T * kv_dim, 2, 0 }, { &g->vp, T * kv_dim, 2, 0 },
+            { &g->iq, T * iq_dim, 2, 0 }, { &g->ik, T * DS4_N_INDEXER_HEAD_DIM, 2, 0 },
+            { &g->q, T * q_dim, 2, 0 }, { &g->gate, T * q_dim, 2, 0 }, { &g->iqn, T * iq_dim, 2, 0 },
+            { &g->attn_o, T * q_dim, 2, 0 }, { &g->sel_blocks, T * g->k_blocks, 2, 0 },
+            { &g->sel_tokens, T * g->sel_stride, 2, 0 }, { &g->n_sel, T, 2, 0 },
+            { &g->part, T * (DS4_N_EXPERT_USED + 1u) * E, 3, 0 },
+            { &g->mid, T * (DS4_N_EXPERT_USED + 1u) * DS4_N_FF_EXP, 3, 0 },
+            { &g->router, T * DS4_N_EXPERT, 3, 0 }, { &g->selected, T * DS4_N_EXPERT_USED, 3, 0 },
+            { &g->weights, T * DS4_N_EXPERT_USED, 3, 0 }, { &g->sh_gate_logit, T, 3, 0 },
+            { &g->moe_lists, (uint64_t)DS4_N_EXPERT * T, 3, 0 }, { &g->moe_counts, DS4_N_EXPERT, 3, 0 },
+            { &g->sh_gate, T * DS4_N_FF_EXP, 3, 0 }, { &g->sh_up, T * DS4_N_FF_EXP, 3, 0 },
+            { &g->sh_mid, T * DS4_N_FF_EXP, 3, 0 }, { &g->sh_out, T * E, 3, 0 },
+        };
+        const size_t n_views = sizeof(v) / sizeof(v[0]);
+        uint64_t end[4] = {0}, region = 0;
+        for (size_t i = 0; i < n_views; i++) {
+            v[i].off = (end[v[i].stage] + 255u) & ~(uint64_t)255u;
+            end[v[i].stage] = v[i].off + v[i].n * sizeof(float);
+            if (end[v[i].stage] > region) region = end[v[i].stage];
+        }
+        QWEN4_ALLOC(stage, region / sizeof(float));
+        for (size_t i = 0; i < n_views && ok; i++) {
+            *v[i].t = ds4_gpu_tensor_view(g->stage, v[i].off, v[i].n * sizeof(float));
+            ok = *v[i].t != NULL;
+        }
+    }
     g->host_row = xmalloc(T * hc_dim * sizeof(float));
 
 private_state:
