@@ -31,8 +31,9 @@ Qwen3.8-Flash-Next Q2（262K context，供 Claude Code 經 llama-swap 使用）�
 | 07e6470 | `DS4_QWEN4_HC_Q8_GEMM=1`：讓 Q8_0 的 `hc_*_up` 在 prefill 也走 GEMM |
 | c3b08cb | IQ2_XXS routed expert 的 decode kernel（`kernel_qwen4_moe_{mid,down}_iq2_*`）：activation 讀一次供 gate／up 與多個 row 共用、down 的權重讀取全部提前。輸出與通用路徑逐位元相同；decode +8–16%。M5 預設開，`DS4_QWEN4_MOE_IQ2=0` 關；`tests/bench_qwen4_moe.c` |
 | 901e0f7 | indexer 分數與 top-k 選取改成分段算，一次只算 64 MiB 暫存放得下的列數（`DS4_QWEN4_IDX_SCORE_MB`）；原本整個 chunk 每個 token 一列（262K、chunk 2048 時 0.5 GiB）。輸出逐字相同、prefill 不變；灌滿峰值 −0.63 GiB |
+| 2ef018e | 每層各階段（PLE、GDN、attention、MoE）的中間 buffer 改成共用同一塊暫存，不再各自一塊；同一時間只有一個階段在用。chunk 2048 時計畫 buffers 2.17 → 1.06 GiB。輸出逐字相同（7K–260K、批次 session、decode 融合、vision），prefill 與 decode 不變；prefill 峰值 −0.6–0.7 GiB |
 
-## 目前跑法（檔案 2026-10-19 起；expert kernel、indexer 分段、`--prefill-chunk 2048` 2026-10-21 起）
+## 目前跑法（檔案 2026-10-19 起；expert kernel、indexer 分段、階段 buffer 共用、`--prefill-chunk 2048` 2026-10-21 起）
 
 轉好的檔案放在 Hugging Face：
 [ansoncat/qwen3.8-flash-next-ds4-64gb-mac-gguf](https://huggingface.co/ansoncat/qwen3.8-flash-next-ds4-64gb-mac-gguf)
@@ -51,7 +52,7 @@ DS4_METAL_NO_RESIDENCY=1 DS4_QWEN4_HC_Q8_GEMM=1 ./ds4-server \
 - `DS4_QWEN4_HC_Q8_GEMM=1` **必帶**：hc 是 Q8_0 的檔沒有它，prefill 會掉 62%。
 - `DS4_METAL_NO_RESIDENCY=1`：閒置時不釘住模型（wired 42 → 4 GiB），速度不變。
 - `--vision` 可省略；投影檔來自 [ggml-org/Qwen3.8-Flash-Next-GGUF](https://huggingface.co/ggml-org/Qwen3.8-Flash-Next-GGUF)。
-- 這台機器用 `sudo sysctl iogpu.wired_limit_mb=57344` 調高了 GPU wired 記憶體上限（短對話約 38 GiB、262K 灌滿約 45 GiB）。
+- 這台機器用 `sudo sysctl iogpu.wired_limit_mb=57344` 調高了 GPU wired 記憶體上限（短對話約 37.5 GiB、262K 灌滿約 44 GiB）。
   64 GB 機器用 macOS 預設值時，長 context 可能配置失敗；把 `--ctx` 調小或調高上限。
 - 每個模型檔用自己的 `--kv-disk-dir` 子目錄：checkpoint 只記 model id 與 routed experts 的量化位元數
   （官方 Q2 與所有衍生檔都是 2），分不出不同的轉檔版本。
@@ -102,6 +103,9 @@ python3 gguf-tools/qwen4_hc_q8.py     --model $M/Qwen3.8-Flash-Next-Q2-downiq2-d
   7K token 的 prompt 37.6 → 38.2、30K 38.1 → 38.8、62K 38.9 → 39.7、127K 40.7 → 41.6、262K 灌滿 44.3 → 45.2 GiB（1024 → 2048）。
   901e0f7（indexer 分數分段）把 2048 在長 context 的增量收回大半：127K 41.56 → 41.35、262K 灌滿 45.24 → 44.61 GiB；
   64K 以下不變。輸出逐字相同、prefill 不變。
+  2ef018e（各階段中間 buffer 共用）在各長度再省 0.6–0.7 GiB：
+  30K 38.75 → 38.06、62K 39.55 → 38.94、127K 41.24 → 40.66、262K 灌滿 44.76 → 44.07 GiB（7K 38.43 → 37.52，只量一次）。
+  輸出逐字相同，prefill 與 decode 不變（±2% 以內）。
 - context：用 `--prefill-chunk 1024` 的話，上游在這台機器上也塞得下 262K（swap 0–35 MB）；
   這個分支在灌滿時多留約 8 GiB 餘裕，一般長度的對話餘裕更多。
 

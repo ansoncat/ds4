@@ -31,8 +31,9 @@ and the Metal backend only and have not been sent upstream. Measurements and dec
 | 07e6470 | `DS4_QWEN4_HC_Q8_GEMM=1` routes Q8_0 `hc_*_up` tensors through the prefill GEMM path as well |
 | c3b08cb | IQ2_XXS routed expert decode kernels (`kernel_qwen4_moe_{mid,down}_iq2_*`): one activation read shared by gate/up and several rows, down-row reads issued up front. Bit-identical to the generic rows; decode +8–16%. Default on M5, `DS4_QWEN4_MOE_IQ2=0` turns it off; `tests/bench_qwen4_moe.c` |
 | 901e0f7 | Indexer scores and top-k selection in slices of the rows a 64 MiB scratch holds (`DS4_QWEN4_IDX_SCORE_MB`); the scratch was a full row of blocks per chunk token (0.5 GiB at 262K with a 2048 chunk). Byte-identical outputs, prefill unchanged; full-context peak −0.63 GiB |
+| 2ef018e | Per-layer stage intermediates (PLE, GDN, attention, MoE) share one scratch region instead of one buffer each; only one stage is live at a time. Planned buffers 2.17 → 1.06 GiB at a 2048 chunk. Byte-identical outputs (7K–260K, batched sessions, decode fusions, vision), prefill and decode unchanged; prefill peak −0.6–0.7 GiB |
 
-## Current setup (file since 2026-10-19, expert kernels, indexer slices and `--prefill-chunk 2048` since 2026-10-21)
+## Current setup (file since 2026-10-19, expert kernels, indexer slices, shared stage buffers and `--prefill-chunk 2048` since 2026-10-21)
 
 The converted file is on Hugging Face:
 [ansoncat/qwen3.8-flash-next-ds4-64gb-mac-gguf](https://huggingface.co/ansoncat/qwen3.8-flash-next-ds4-64gb-mac-gguf)
@@ -52,7 +53,7 @@ DS4_METAL_NO_RESIDENCY=1 DS4_QWEN4_HC_Q8_GEMM=1 ./ds4-server \
 - `DS4_METAL_NO_RESIDENCY=1`: the model is not pinned while idle (wired memory 42 → 4 GiB), with no speed cost.
 - `--vision` is optional; the projector comes from [ggml-org/Qwen3.8-Flash-Next-GGUF](https://huggingface.co/ggml-org/Qwen3.8-Flash-Next-GGUF).
 - This machine raises the GPU wired-memory limit with `sudo sysctl iogpu.wired_limit_mb=57344`
-  (about 38 GiB in use for a short conversation, 45 GiB with a full 262K context). With the macOS default on 64 GB,
+  (about 37.5 GiB in use for a short conversation, 44 GiB with a full 262K context). With the macOS default on 64 GB,
   long contexts may fail to allocate; use a smaller `--ctx` or raise the limit.
 - Give each model file its own `--kv-disk-dir` subdirectory: a checkpoint records only the model id and the routed
   experts' quantization bits (2 for the official Q2 and every file derived from it), so it cannot tell conversions apart.
@@ -105,6 +106,9 @@ Every step was measured against the step before it in the same session (the spee
   7K-token prompt 37.6 → 38.2, 30K 38.1 → 38.8, 62K 38.9 → 39.7, 127K 40.7 → 41.6, full 262K 44.3 → 45.2 GiB (1024 → 2048).
   901e0f7 (indexer scores in slices) takes 2048 back down at long contexts: 127K 41.56 → 41.35, full 262K 45.24 → 44.61 GiB;
   unchanged up to 64K. Outputs byte-identical, prefill unchanged.
+  2ef018e (stage intermediates share one region) takes off another 0.6–0.7 GiB at every length:
+  30K 38.75 → 38.06, 62K 39.55 → 38.94, 127K 41.24 → 40.66, full 262K 44.76 → 44.07 GiB (7K 38.43 → 37.52, one sample).
+  Outputs byte-identical, prefill and decode unchanged (within ±2%).
 - Context: with `--prefill-chunk 1024`, upstream also fits a full 262K context on this machine (0–35 MB of swap);
   this branch leaves about 8 GiB more headroom at full context and much more in normal-length conversations.
 
